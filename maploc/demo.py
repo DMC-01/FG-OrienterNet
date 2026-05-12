@@ -10,6 +10,14 @@ from . import logger
 from .data.image import pad_image, rectify_image, resize_image
 from .evaluation.run import pretrained_models, resolve_checkpoint_path
 from .models.orienternet import OrienterNet
+
+# Add omegaconf to safe globals for PyTorch 2.6+ compatibility
+try:
+    from torch.serialization import add_safe_globals
+    from omegaconf import DictConfig
+    add_safe_globals([DictConfig])
+except (ImportError, AttributeError):
+    pass
 from .models.voting import argmax_xyr, fuse_gps
 from .osm.raster import Canvas
 from .utils.exif import EXIF
@@ -101,7 +109,7 @@ class Demo:
         if experiment_or_path in pretrained_models:
             experiment_or_path, _ = pretrained_models[experiment_or_path]
         path = resolve_checkpoint_path(experiment_or_path)
-        ckpt = torch.load(path, map_location=(lambda storage, loc: storage))
+        ckpt = torch.load(path, map_location=(lambda storage, loc: storage), weights_only=False)
         config = ckpt["hyper_parameters"]
         config.model.update(kwargs)
         config.model.image_encoder.backbone.pretrained = False

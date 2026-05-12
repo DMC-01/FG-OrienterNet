@@ -1,6 +1,7 @@
 datasets/
 experiments/
 outputs/
+data/
 *.mp4
 lsf*
 .DS_Store
@@ -136,3 +137,6 @@ dmypy.json
 
 # vscode
 .vscode
+
+# pycharm
+.idea

@@ -7,6 +7,13 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torchmetrics import MeanMetric, MetricCollection
 
+# Add omegaconf to safe globals for PyTorch 2.6+ compatibility
+try:
+    from torch.serialization import add_safe_globals
+    add_safe_globals([DictConfig])
+except (ImportError, AttributeError):
+    pass
+
 from . import logger
 from .models import get_model
 
@@ -94,7 +101,7 @@ class GenericModule(pl.LightningModule):
         assert hparams_file is None, "hparams are not supported."
 
         checkpoint = torch.load(
-            checkpoint_path, map_location=map_location or (lambda storage, loc: storage)
+            checkpoint_path, map_location=map_location or (lambda storage, loc: storage), weights_only=False
         )
         if find_best:
             best_score, best_name = None, None
