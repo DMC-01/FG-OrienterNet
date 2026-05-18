@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 
 """
-Run OrienterNet localization on extracted images and export predictions to CSV.
+Run OrienterNet localization on images and export predictions to CSV.
 
-Expected project structure:
+Supports two image layouts:
 
-    FG-OrienterNet/
-    ├── maploc/
-    ├── processing/
-    │   └── batch_process.py
-    └── data/
-        ├── bern_ground_all.h5
-        └── extracted_images/
-            ├── image_0.jpg
-            ├── image_1.jpg
-            └── ...
+1. Extracted images named like:
+       data/extracted_images/image_<id>.jpg
+       data/extracted_images/image_<id>.png
 
-Expected image names:
-    image_<id>.jpg
-    image_<id>.png
+2. Original nested images resolved through a CSV manifest with columns:
+       id, relative_image_path
+
+   Example manifest row:
+       id,relative_image_path
+       123,/mapillary_dataset/175/175345001056338.jpg
+
+   With:
+       --images-dir-original data/og
+       --image-manifest-csv data/og_image_paths.csv
+
+   the image path resolves to:
+       data/og/175/175345001056338.jpg
 
 Expected H5 metadata structure:
     metadata/id
@@ -34,27 +37,28 @@ Run naming:
 
     Example:
         python processing/batch_process.py \
-            --tile-size 272 \
+            --tile-size 136 \
             --num-rotations 256 \
-            --data-version h5v
+            --data-version og
 
     Writes:
-        data/runs/process_272t_256r_h5v/results.csv
-        data/runs/process_272t_256r_h5v/artifacts/
-
-    You can override the generated run name with:
-        --run-name my_custom_run
-
-    You can also override output paths directly with:
-        --output-csv ...
-        --output-artifacts-dir ...
+        data/runs/process_136t_256r_og/results.csv
+        data/runs/process_136t_256r_og/artifacts/
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
+import json
+import logging
 import os
+import re
 import sys
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, Optional, Set, Tuple
 
 # =============================================================================
 # Project import setup
@@ -71,19 +75,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # On Windows, expandable_segments may not be supported, so use max_split_size_mb.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
 
-
 # =============================================================================
-# Imports
+# Imports requiring project / ML dependencies
 # =============================================================================
-
-import argparse
-import csv
-import json
-import logging
-import re
-import traceback
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set
 
 import h5py
 import numpy as np
@@ -95,7 +89,6 @@ from maploc.osm.tiling import TileManager
 from maploc.osm.viz import Colormap
 from maploc.utils.exif import EXIF
 
-
 # =============================================================================
 # Logging
 # =============================================================================
@@ -106,40 +99,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# PyTorch configuration
-# =============================================================================
-
-def configure_pytorch_memory() -> None:
-    """Configure PyTorch runtime behavior."""
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-
-    logger.info(
-        "PyTorch CUDA allocator config: %s",
-        os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
-    )
-
-    if torch.cuda.is_available():
-        logger.info("CUDA available: True")
-        logger.info("CUDA device count: %d", torch.cuda.device_count())
-
-        for idx in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(idx)
-            logger.info(
-                "GPU %d: %s, %.2f GB VRAM",
-                idx,
-                props.name,
-                props.total_memory / 1024**3,
-            )
-    else:
-        logger.info("CUDA available: False")
-
-
-configure_pytorch_memory()
-
 
 # =============================================================================
 # Constants
@@ -177,10 +136,14 @@ CSV_HEADERS = [
 # OrienterNet OSM raster layer limits.
 RASTER_LAYER_MAX_VALUES = [7, 10, 33]
 
+# Prefix in the manifest that should be ignored because --images-dir-original
+# already points to the dataset root below it.
+DEFAULT_MANIFEST_PREFIX_TO_STRIP = "mapillary_dataset/"
 
 # =============================================================================
 # Data models
 # =============================================================================
+
 
 @dataclass
 class GroundTruthMetadata:
@@ -193,9 +156,10 @@ class GroundTruthMetadata:
 @dataclass
 class LocationPrior:
     """Location prior with source information."""
+
     latitude: float
     longitude: float
-    yaw: Optional[float] = None  # Optional heading
+    yaw: Optional[float] = None
     source: str = "unknown"  # "h5" | "csv" | "exif" | "combined"
 
 
@@ -209,11 +173,48 @@ class ProcessorConfig:
     num_rotations: int = 128
     device: str = "cuda"
     save_artifacts: bool = False
+    images_dir_original: Optional[Path] = None
+    image_manifest_csv: Optional[Path] = None
+    manifest_prefix_to_strip: str = DEFAULT_MANIFEST_PREFIX_TO_STRIP
+    prior_strategy: str = "h5"
+    csv_prior_path: Optional[Path] = None
+
+
+# =============================================================================
+# PyTorch configuration
+# =============================================================================
+
+
+def configure_pytorch_memory() -> None:
+    """Configure PyTorch runtime behavior."""
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+    logger.info(
+        "PyTorch CUDA allocator config: %s",
+        os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+    )
+
+    if torch.cuda.is_available():
+        logger.info("CUDA available: True")
+        logger.info("CUDA device count: %d", torch.cuda.device_count())
+
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            logger.info(
+                "GPU %d: %s, %.2f GB VRAM",
+                idx,
+                props.name,
+                props.total_memory / 1024**3,
+            )
+    else:
+        logger.info("CUDA available: False")
 
 
 # =============================================================================
 # Run naming helpers
 # =============================================================================
+
 
 def sanitize_run_label(value: str) -> str:
     """Return a filesystem-safe run label component."""
@@ -237,6 +238,7 @@ def build_run_name(tile_size: int, num_rotations: int, data_version: str) -> str
 # =============================================================================
 # Main processor
 # =============================================================================
+
 
 class ImageProcessor:
     def __init__(self, config: ProcessorConfig):
@@ -273,10 +275,21 @@ class ImageProcessor:
     # -------------------------------------------------------------------------
 
     def load_csv_priors(self) -> Dict[int, LocationPrior]:
-        """Load location priors from CSV file."""
+        """Load optional location priors from CSV file.
+
+        Expected columns for this optional prior CSV:
+            image_id, latitude, longitude, yaw
+
+        This is separate from image_manifest_csv, which is only for resolving
+        nested image file paths.
+        """
         csv_priors: Dict[int, LocationPrior] = {}
 
-        if self.config.csv_prior_path is None or not self.config.csv_prior_path.exists():
+        if self.config.csv_prior_path is None:
+            return csv_priors
+
+        if not self.config.csv_prior_path.exists():
+            logger.warning("CSV prior file does not exist: %s", self.config.csv_prior_path)
             return csv_priors
 
         logger.info("Loading CSV priors from %s", self.config.csv_prior_path)
@@ -480,12 +493,114 @@ class ImageProcessor:
         )
 
     # -------------------------------------------------------------------------
-    # Image discovery (extracted or original)
+    # Image discovery: manifest or extracted image_<id> fallback
     # -------------------------------------------------------------------------
 
-    def find_local_images(self) -> list[Path]:
-        """Find local image files matching image_*.jpg or image_*.png."""
-        # If original images directory is specified, prefer it
+    def load_image_manifest(self) -> Dict[int, Path]:
+        """
+        Load image paths from a CSV with columns:
+            id, relative_image_path
+
+        Example relative_image_path:
+            /mapillary_dataset/175/175345001056338.jpg
+
+        The configured prefix, by default 'mapillary_dataset/', is stripped,
+        and the remaining path is resolved relative to images_dir_original.
+        """
+        image_paths: Dict[int, Path] = {}
+
+        if self.config.image_manifest_csv is None:
+            return image_paths
+
+        if not self.config.image_manifest_csv.exists():
+            raise FileNotFoundError(
+                f"Image manifest CSV not found: {self.config.image_manifest_csv}"
+            )
+
+        base_dir = self.config.images_dir_original or self.config.images_dir
+
+        logger.info("Loading image manifest from %s", self.config.image_manifest_csv)
+        logger.info("Resolving manifest image paths relative to %s", base_dir)
+
+        with self.config.image_manifest_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames is None:
+                raise ValueError(f"Image manifest has no header row: {self.config.image_manifest_csv}")
+
+            required_columns = {"id", "relative_image_path"}
+            missing_columns = required_columns - set(reader.fieldnames)
+            if missing_columns:
+                raise ValueError(
+                    f"Image manifest is missing required columns {sorted(missing_columns)}. "
+                    f"Found columns: {reader.fieldnames}"
+                )
+
+            for row in reader:
+                image_id = self._safe_int(row.get("id"))
+                relative_image_path = (row.get("relative_image_path") or "").strip()
+
+                if image_id is None or not relative_image_path:
+                    continue
+
+                normalized_path = self._normalize_manifest_relative_path(relative_image_path)
+                image_paths[image_id] = base_dir / Path(normalized_path)
+
+        logger.info("Loaded %d image paths from manifest", len(image_paths))
+        return image_paths
+
+    def _normalize_manifest_relative_path(self, relative_image_path: str) -> str:
+        """Normalize a manifest path and strip the configured dataset prefix."""
+        normalized = relative_image_path.replace("\\", "/").lstrip("/")
+
+        prefix = self.config.manifest_prefix_to_strip.replace("\\", "/").strip("/")
+        if prefix:
+            prefix = prefix + "/"
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+
+        return normalized
+
+    def find_local_images(self) -> Dict[int, Path]:
+        """
+        Find local images.
+
+        If image_manifest_csv is provided, use:
+            manifest id -> resolved image path
+
+        Otherwise fall back to the older extracted-image layout:
+            image_<id>.jpg/png/jpeg in --images-dir or --images-dir-original.
+        """
+        if self.config.image_manifest_csv is not None:
+            image_paths = self.load_image_manifest()
+
+            existing_image_paths = {
+                image_id: image_path
+                for image_id, image_path in image_paths.items()
+                if image_path.exists()
+            }
+
+            missing_count = len(image_paths) - len(existing_image_paths)
+
+            logger.info("Found %d existing images from manifest", len(existing_image_paths))
+
+            if missing_count:
+                logger.warning(
+                    "Manifest referenced %d images that do not exist on disk",
+                    missing_count,
+                )
+
+                # Print a few examples to make path bugs easy to diagnose.
+                shown = 0
+                for image_id, image_path in image_paths.items():
+                    if not image_path.exists():
+                        logger.warning("Missing manifest image example: id=%s path=%s", image_id, image_path)
+                        shown += 1
+                        if shown >= 5:
+                            break
+
+            return existing_image_paths
+
         images_dir = self.config.images_dir_original or self.config.images_dir
 
         logger.info("Scanning for images in %s", images_dir)
@@ -493,20 +608,40 @@ class ImageProcessor:
         if not images_dir.exists():
             raise FileNotFoundError(f"Images directory not found: {images_dir}")
 
-        jpg_images = sorted(images_dir.glob("image_*.jpg"))
-        png_images = sorted(images_dir.glob("image_*.png"))
+        patterns = [
+            "image_*.jpg",
+            "image_*.jpeg",
+            "image_*.png",
+            "image_*.JPG",
+            "image_*.JPEG",
+            "image_*.PNG",
+        ]
 
-        images = jpg_images + png_images
+        image_paths: Dict[int, Path] = {}
 
-        logger.info("Found %d images", len(images))
+        for pattern in patterns:
+            for image_path in images_dir.glob(pattern):
+                try:
+                    image_id = self.get_image_id(image_path)
+                except ValueError:
+                    logger.warning("Skipping image with invalid extracted-image filename: %s", image_path)
+                    continue
+                image_paths[image_id] = image_path
+
+        logger.info("Found %d images", len(image_paths))
+
         if self.config.images_dir_original:
             logger.info("Using original images from %s", self.config.images_dir_original)
-        return images
+
+        return image_paths
 
     @staticmethod
     def get_image_id(image_path: Path) -> int:
         """Extract image id from filename like image_123.jpg."""
-        return int(image_path.stem.replace("image_", ""))
+        stem = image_path.stem
+        if not stem.startswith("image_"):
+            raise ValueError(f"Expected filename like image_<id>.jpg, got: {image_path.name}")
+        return int(stem.replace("image_", "", 1))
 
     # -------------------------------------------------------------------------
     # Main processing
@@ -529,7 +664,7 @@ class ImageProcessor:
             )
 
         h5_metadata = self.load_h5_metadata()
-        csv_priors = self.load_csv_priors()  # Load CSV priors if available
+        csv_priors = self.load_csv_priors()
         processed_ids = self.load_processed_image_ids()
 
         failed_ids: Set[int] = set()
@@ -538,25 +673,38 @@ class ImageProcessor:
             failed_ids = self.load_failed_image_ids()
             processed_ids -= failed_ids
 
-        local_images = self.find_local_images()
+        local_images_by_id = self.find_local_images()
+
+        before_h5_filter = len(local_images_by_id)
+        local_images_by_id = {
+            image_id: image_path
+            for image_id, image_path in local_images_by_id.items()
+            if image_id in h5_metadata
+        }
+        missing_h5_count = before_h5_filter - len(local_images_by_id)
+        if missing_h5_count:
+            logger.warning(
+                "Skipped %d images because their IDs were not found in H5 metadata",
+                missing_h5_count,
+            )
 
         # Shard images by worker id.
         # Example with num_workers=2:
         #   worker 0 processes IDs where image_id % 2 == 0
         #   worker 1 processes IDs where image_id % 2 == 1
-        local_images = [
-            image_path
-            for image_path in local_images
-            if self.get_image_id(image_path) % num_workers == worker_id
+        local_images_by_id = {
+            image_id: image_path
+            for image_id, image_path in local_images_by_id.items()
+            if image_id % num_workers == worker_id
+        }
+
+        images_to_process: list[Tuple[int, Path]] = [
+            (image_id, image_path)
+            for image_id, image_path in sorted(local_images_by_id.items())
+            if image_id not in processed_ids
         ]
 
-        images_to_process = [
-            image_path
-            for image_path in local_images
-            if self.get_image_id(image_path) not in processed_ids
-        ]
-
-        skipped_count = len(local_images) - len(images_to_process)
+        skipped_count = len(local_images_by_id) - len(images_to_process)
 
         if max_images is not None:
             images_to_process = images_to_process[:max_images]
@@ -574,15 +722,15 @@ class ImageProcessor:
         if failed_ids:
             logger.info("Retrying failed images: %d", len(failed_ids))
 
-        for index, image_path in enumerate(images_to_process, start=1):
-            image_id = self.get_image_id(image_path)
+        for index, (image_id, image_path) in enumerate(images_to_process, start=1):
             is_retry = image_id in failed_ids
 
             logger.info(
-                "[%d/%d] Processing %s%s",
+                "[%d/%d] Processing id=%s path=%s%s",
                 index,
                 len(images_to_process),
-                image_path.name,
+                image_id,
+                image_path,
                 " [retry]" if is_retry else "",
             )
 
@@ -614,7 +762,7 @@ class ImageProcessor:
         """Process one image and return one CSV row."""
         result = self._empty_result_row(image_id, image_path)
 
-        # Extract EXIF data from image
+        # Extract EXIF data from image.
         exif_data = self._extract_exif_metadata(image_path)
         result.update(exif_data)
 
@@ -622,17 +770,18 @@ class ImageProcessor:
 
         if ground_truth is None:
             result["error_message"] = "No ground truth metadata found in H5"
-            prior_latlon = None
         else:
             self._add_ground_truth_to_result(result, ground_truth)
-            # Store source position (from h5)
             result["src_latitude"] = ground_truth.latitude
             result["src_longitude"] = ground_truth.longitude
             result["src_yaw"] = ground_truth.yaw
 
-        # Resolve location prior based on strategy
+        # Resolve location prior based on strategy.
         location_prior, prior_source = self._resolve_location_prior(
-            image_id, image_path, ground_truth, csv_priors
+            image_id,
+            image_path,
+            ground_truth,
+            csv_priors,
         )
 
         if location_prior is not None:
@@ -759,28 +908,22 @@ class ImageProcessor:
         camera: Any,
         raster: np.ndarray,
     ) -> None:
-        # Save to data/runs/image_<id> directory as primary location
         folder = self.config.output_artifacts_dir / f"image_{image_id}"
         folder.mkdir(parents=True, exist_ok=True)
 
-        # Save prediction maps (probability map) 
         prediction_map = prob.detach().cpu().numpy()
         np.save(folder / "prediction_map.npy", prediction_map)
-        
-        # Save neural map features
+
         neural_map_np = neural_map.detach().cpu().numpy()
         np.save(folder / "neural_map.npy", neural_map_np)
 
-        # Save rectified image
         rectified_image = self._tensor_to_uint8_image(image_rectified)
         Image.fromarray(rectified_image).save(folder / "rectified_image.jpg")
 
-        # Save camera metadata
         camera_dict = self._camera_to_dict(camera)
         with (folder / "camera.json").open("w", encoding="utf-8") as f:
             json.dump(camera_dict, f, indent=2)
 
-        # Save OSM visualization
         rgb = Colormap.apply(raster)
         Image.fromarray((rgb * 255).astype(np.uint8)).save(folder / "osm.jpg")
 
@@ -826,19 +969,22 @@ class ImageProcessor:
             with open(image_path, "rb") as fid:
                 exif = EXIF(fid, lambda: None)
 
-                # Extract make and model
                 exif_data["exif_make"] = exif.extract_make()
                 exif_data["exif_model"] = exif.extract_model()
 
-                # Extract focal lengths
                 focal_35mm, focal_ratio = exif.extract_focal()
-                exif_data["exif_focal_35mm"] = float(focal_35mm) if focal_35mm else np.nan
-                exif_data["exif_focal_ratio"] = float(focal_ratio) if focal_ratio else np.nan
+                exif_data["exif_focal_35mm"] = (
+                    float(focal_35mm) if focal_35mm else np.nan
+                )
+                exif_data["exif_focal_ratio"] = (
+                    float(focal_ratio) if focal_ratio else np.nan
+                )
 
-                # Extract orientation
-                exif_data["exif_orientation"] = float(exif.extract_orientation())
+                orientation = exif.extract_orientation()
+                exif_data["exif_orientation"] = (
+                    float(orientation) if orientation is not None else np.nan
+                )
 
-                # Extract altitude
                 altitude = exif.extract_altitude()
                 exif_data["exif_altitude"] = float(altitude) if altitude else np.nan
 
@@ -855,13 +1001,9 @@ class ImageProcessor:
                 geo = exif.extract_geo()
 
                 if geo and "latitude" in geo and "longitude" in geo:
-                    lat = geo["latitude"]
-                    lon = geo["longitude"]
-                    alt = geo.get("altitude")
-
                     return LocationPrior(
-                        latitude=lat,
-                        longitude=lon,
+                        latitude=float(geo["latitude"]),
+                        longitude=float(geo["longitude"]),
                         yaw=None,
                         source="exif",
                     )
@@ -876,7 +1018,7 @@ class ImageProcessor:
         image_path: Path,
         h5_metadata: Optional[GroundTruthMetadata],
         csv_priors: Dict[int, LocationPrior],
-    ) -> tuple[Optional[LocationPrior], str]:
+    ) -> Tuple[Optional[LocationPrior], str]:
         """
         Resolve location prior based on strategy.
 
@@ -886,17 +1028,14 @@ class ImageProcessor:
         """
         strategy = self.config.prior_strategy.lower()
 
-        # Strategy 1: CSV prior (if available)
         if strategy in ("csv", "fallback") and image_id in csv_priors:
             return csv_priors[image_id], "csv"
 
-        # Strategy 2: EXIF geo (if available)
         if strategy in ("exif", "fallback"):
             exif_prior = self._extract_location_prior_from_exif(image_path)
             if exif_prior is not None:
                 return exif_prior, "exif"
 
-        # Strategy 3: H5 metadata (always available as fallback)
         if h5_metadata is not None:
             prior = LocationPrior(
                 latitude=h5_metadata.latitude,
@@ -906,7 +1045,6 @@ class ImageProcessor:
             )
             return prior, "h5"
 
-        # No prior found
         return None, "none"
 
     # -------------------------------------------------------------------------
@@ -915,7 +1053,7 @@ class ImageProcessor:
 
     def _empty_result_row(self, image_id: int, image_path: Path) -> Dict[str, Any]:
         try:
-            relative_path = image_path.relative_to(self.config.images_dir.parent)
+            relative_path = image_path.relative_to(PROJECT_ROOT)
         except ValueError:
             relative_path = image_path
 
@@ -975,15 +1113,15 @@ class ImageProcessor:
 
         df = pd.read_csv(self.config.output_csv)
 
-        successful = df["pred_x_meters"].notna()
-        has_ground_truth = df["gt_latitude"].notna()
+        successful = df["pred_x_meters"].notna() if "pred_x_meters" in df else []
+        has_ground_truth = df["gt_latitude"].notna() if "gt_latitude" in df else []
 
         logger.info("")
         logger.info("=== SUMMARY STATISTICS ===")
         logger.info("Total rows: %d", len(df))
-        logger.info("Successful predictions: %d", int(successful.sum()))
-        logger.info("Failed predictions: %d", int((~successful).sum()))
-        logger.info("Rows with ground truth: %d", int(has_ground_truth.sum()))
+        logger.info("Successful predictions: %d", int(successful.sum()) if len(df) else 0)
+        logger.info("Failed predictions: %d", int((~successful).sum()) if len(df) else 0)
+        logger.info("Rows with ground truth: %d", int(has_ground_truth.sum()) if len(df) else 0)
 
         if "error_message" in df.columns:
             failed_with_error = df[df["error_message"].fillna("") != ""]
@@ -1037,6 +1175,7 @@ class ImageProcessor:
 # CLI
 # =============================================================================
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Process images through OrienterNet and save localization results to CSV.",
@@ -1051,16 +1190,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--images-dir",
         default="data/extracted_images",
-        help="Directory containing extracted images.",
+        help="Directory containing extracted images named image_<id>.*.",
     )
 
     parser.add_argument(
         "--images-dir-original",
         default=None,
         help=(
-            "Directory containing original (non-extracted) images. "
-            "If provided, these will be used instead of extracted images. "
-            "Filenames should match: image_<id>.jpg or image_<id>.png"
+            "Directory containing original nested images. "
+            "Use together with --image-manifest-csv when filenames are not image_<id>.*."
+        ),
+    )
+
+    parser.add_argument(
+        "--image-manifest-csv",
+        default=None,
+        help=(
+            "CSV with columns 'id' and 'relative_image_path'. The id is matched "
+            "to H5 metadata/id. The relative path is resolved under --images-dir-original."
+        ),
+    )
+
+    parser.add_argument(
+        "--manifest-prefix-to-strip",
+        default=DEFAULT_MANIFEST_PREFIX_TO_STRIP,
+        help=(
+            "Path prefix to strip from relative_image_path before resolving under "
+            "--images-dir-original. Default: mapillary_dataset/"
         ),
     )
 
@@ -1093,7 +1249,7 @@ def parse_args() -> argparse.Namespace:
         default="h5v",
         help=(
             "Short version label for the H5/data source. Used in automatic "
-            "run names, e.g. h5v."
+            "run names, e.g. h5v or og."
         ),
     )
 
@@ -1151,9 +1307,8 @@ def parse_args() -> argparse.Namespace:
         "--csv-prior",
         default=None,
         help=(
-            "Optional CSV file with location priors (latitude, longitude, yaw columns). "
-            "Used with --prior-strategy csv or fallback. "
-            "Image IDs must match image_<id>.jpg filenames."
+            "Optional CSV file with location priors: image_id, latitude, longitude, yaw. "
+            "Used with --prior-strategy csv or fallback."
         ),
     )
 
@@ -1247,13 +1402,21 @@ def build_config(args: argparse.Namespace) -> ProcessorConfig:
         num_rotations=args.num_rotations,
         device=args.device,
         save_artifacts=args.save_artifacts,
-        images_dir_original=Path(args.images_dir_original) if args.images_dir_original else None,
+        images_dir_original=(
+            Path(args.images_dir_original) if args.images_dir_original else None
+        ),
+        image_manifest_csv=(
+            Path(args.image_manifest_csv) if args.image_manifest_csv else None
+        ),
+        manifest_prefix_to_strip=args.manifest_prefix_to_strip,
         prior_strategy=args.prior_strategy,
         csv_prior_path=Path(args.csv_prior) if args.csv_prior else None,
     )
 
 
 def main() -> None:
+    configure_pytorch_memory()
+
     args = parse_args()
 
     if args.debug:
