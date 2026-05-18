@@ -88,6 +88,8 @@ from maploc.demo import Demo
 from maploc.osm.tiling import TileManager
 from maploc.osm.viz import Colormap
 from maploc.utils.exif import EXIF
+from maploc.utils.viz_2d import features_to_RGB
+from maploc.utils.viz_localization import likelihood_overlay
 
 # =============================================================================
 # Logging
@@ -850,6 +852,8 @@ class ImageProcessor:
                     image_rectified=image_rectified,
                     camera=camera,
                     raster=canvas.raster,
+                    canvas=canvas,
+                    predicted_uv=uv,
                 )
 
             logger.info(
@@ -918,39 +922,158 @@ class ImageProcessor:
         image_rectified: Any,
         camera: Any,
         raster: np.ndarray,
+        canvas: Any,
+        predicted_uv: Any,
     ) -> None:
+        """Save demo-style visual artifacts for one prediction.
+
+        The RGB exports intentionally mirror the OrienterNet demo notebook:
+        - OSM tile: ``Colormap.apply(canvas.raster)``
+        - prediction map: ``likelihood_overlay(prob.max(-1), map_viz.mean(...))``
+        - neural map: ``features_to_RGB(neural_map)``
+
+        The raw tensors are still saved as ``.npy`` files for debugging.
+        """
         folder = self.config.output_artifacts_dir / f"image_{image_id}"
         folder.mkdir(parents=True, exist_ok=True)
 
-        prediction_map = prob.detach().cpu().numpy()
-        np.save(folder / "prediction_map.npy", prediction_map)
+        prob_np = self._to_numpy(prob)
+        np.save(folder / "prediction_map.npy", prob_np)
 
-        neural_map_np = neural_map.detach().cpu().numpy()
+        neural_map_np = self._to_numpy(neural_map)
         np.save(folder / "neural_map.npy", neural_map_np)
 
-        rectified_image = self._tensor_to_uint8_image(image_rectified)
+        rectified_image = self._image_like_to_uint8(image_rectified)
         Image.fromarray(rectified_image).save(folder / "rectified_image.jpg")
 
         camera_dict = self._camera_to_dict(camera)
         with (folder / "camera.json").open("w", encoding="utf-8") as f:
             json.dump(camera_dict, f, indent=2)
 
-        rgb = Colormap.apply(raster)
-        Image.fromarray((rgb * 255).astype(np.uint8)).save(folder / "osm.jpg")
+        # Demo-equivalent OSM visualization. This is the categorical raster
+        # rendered through OrienterNet's colormap, not a satellite/base-map tile.
+        map_viz = Colormap.apply(raster)
+        self._save_float_rgb(folder / "osm_tile.jpg", map_viz)
+
+        # Demo-equivalent prediction map. The localization probability is defined
+        # over x/y/rotation, so the notebook visualizes the best rotation per pixel.
+        prediction_xy = prob_np.max(axis=-1) if prob_np.ndim >= 3 else prob_np
+        np.save(folder / "prediction_map_xy.npy", prediction_xy)
+
+        prediction_overlay = likelihood_overlay(
+            prediction_xy,
+            map_viz.mean(axis=-1, keepdims=True),
+        )
+        self._save_float_rgb(folder / "prediction_map.jpg", prediction_overlay)
+
+        # A grayscale probability-only export is useful to check whether the
+        # model produced a non-zero spatial likelihood away from the overlay.
+        probability_rgb = self._probability_to_uint8_rgb(prediction_xy)
+        Image.fromarray(probability_rgb).save(folder / "prediction_probability.jpg")
+
+        neural_map_rgb = self._neural_map_to_rgb(neural_map_np)
+        Image.fromarray(neural_map_rgb).save(folder / "neural_map_rgb.jpg")
+
+        # Save the predicted pixel in map/image coordinates for easier inspection.
+        predicted_uv_np = self._to_numpy(predicted_uv).reshape(-1).tolist()
+        artifact_meta = {
+            "predicted_uv": [float(x) for x in predicted_uv_np],
+            "canvas_bbox": self._to_numpy(canvas.bbox).reshape(-1).tolist()
+            if hasattr(canvas, "bbox")
+            else None,
+            "files": {
+                "rectified_image": "rectified_image.jpg",
+                "osm_tile": "osm_tile.jpg",
+                "neural_map_rgb": "neural_map_rgb.jpg",
+                "prediction_map": "prediction_map.jpg",
+                "prediction_probability": "prediction_probability.jpg",
+                "prediction_map_raw": "prediction_map.npy",
+                "prediction_map_xy_raw": "prediction_map_xy.npy",
+                "neural_map_raw": "neural_map.npy",
+            },
+        }
+        with (folder / "artifacts.json").open("w", encoding="utf-8") as f:
+            json.dump(artifact_meta, f, indent=2)
 
         logger.info("Artifacts saved for image %d to %s", image_id, folder)
 
     @staticmethod
-    def _tensor_to_uint8_image(image_tensor: Any) -> np.ndarray:
-        image = image_tensor.detach().cpu()
+    def _to_numpy(value: Any) -> np.ndarray:
+        """Convert torch tensors or array-like values to a CPU numpy array."""
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            return value.numpy()
+        return np.asarray(value)
 
-        if image.ndim == 3:
-            image = image.permute(1, 2, 0)
+    @staticmethod
+    def _save_float_rgb(path: Path, image: np.ndarray) -> None:
+        """Save an RGB image represented either as float [0, 1] or uint8."""
+        image_np = np.asarray(image)
+        if image_np.dtype == np.uint8:
+            out = image_np
+        else:
+            out = np.clip(image_np, 0.0, 1.0)
+            out = (out * 255).astype(np.uint8)
+        Image.fromarray(out).save(path)
 
-        image_np = image.numpy()
-        image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
+    @staticmethod
+    def _image_like_to_uint8(image_like: Any) -> np.ndarray:
+        """Convert OrienterNet image tensors/arrays to an HxWxC uint8 image."""
+        image_np = ImageProcessor._to_numpy(image_like)
 
-        return image_np
+        # Drop a singleton batch dimension if present.
+        if image_np.ndim == 4 and image_np.shape[0] == 1:
+            image_np = image_np[0]
+
+        # Convert CHW to HWC when needed.
+        if image_np.ndim == 3 and image_np.shape[0] in (1, 3, 4):
+            image_np = np.moveaxis(image_np, 0, -1)
+
+        if image_np.ndim == 2:
+            image_np = np.repeat(image_np[..., None], 3, axis=-1)
+
+        if image_np.shape[-1] == 1:
+            image_np = np.repeat(image_np, 3, axis=-1)
+
+        if image_np.dtype == np.uint8:
+            return image_np
+
+        # Most OrienterNet/demo tensors are already normalized to [0, 1].
+        # If an array appears to be in [0, 255], avoid scaling it a second time.
+        finite = image_np[np.isfinite(image_np)]
+        max_value = float(finite.max()) if finite.size else 1.0
+        if max_value > 2.0:
+            return np.clip(image_np, 0, 255).astype(np.uint8)
+
+        return np.clip(image_np * 255, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _neural_map_to_rgb(neural_map_np: np.ndarray) -> np.ndarray:
+        """Convert neural-map features to RGB using the demo helper."""
+        # The demo helper returns a tuple/list, even for one feature map.
+        rgb_items = features_to_RGB(neural_map_np)
+        neural_map_rgb = rgb_items[0] if isinstance(rgb_items, (tuple, list)) else rgb_items
+        return ImageProcessor._image_like_to_uint8(neural_map_rgb)
+
+    @staticmethod
+    def _probability_to_uint8_rgb(probability_xy: np.ndarray) -> np.ndarray:
+        """Save a simple probability-only heat image without applying matplotlib."""
+        prob = np.asarray(probability_xy, dtype=np.float32)
+        prob = np.nan_to_num(prob, nan=0.0, posinf=0.0, neginf=0.0)
+
+        min_value = float(prob.min()) if prob.size else 0.0
+        max_value = float(prob.max()) if prob.size else 0.0
+
+        if max_value > min_value:
+            prob = (prob - min_value) / (max_value - min_value)
+        else:
+            prob = np.zeros_like(prob)
+
+        gray = np.clip(prob * 255, 0, 255).astype(np.uint8)
+        return np.repeat(gray[..., None], 3, axis=-1)
 
     @staticmethod
     def _camera_to_dict(camera: Any) -> Dict[str, Any]:
