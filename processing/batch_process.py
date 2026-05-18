@@ -26,6 +26,28 @@ Expected H5 metadata structure:
     metadata/latitude
     metadata/longitude
     metadata/yaw
+
+Run naming:
+    By default, outputs are written into a parameter-based run folder:
+
+        data/runs/process_<tile-size>t_<num-rotations>r_<data-version>/
+
+    Example:
+        python processing/batch_process.py \
+            --tile-size 272 \
+            --num-rotations 256 \
+            --data-version h5v
+
+    Writes:
+        data/runs/process_272t_256r_h5v/results.csv
+        data/runs/process_272t_256r_h5v/artifacts/
+
+    You can override the generated run name with:
+        --run-name my_custom_run
+
+    You can also override output paths directly with:
+        --output-csv ...
+        --output-artifacts-dir ...
 """
 
 from __future__ import annotations
@@ -58,6 +80,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
@@ -70,6 +93,7 @@ from PIL import Image
 from maploc.demo import Demo
 from maploc.osm.tiling import TileManager
 from maploc.osm.viz import Colormap
+from maploc.utils.exif import EXIF
 
 
 # =============================================================================
@@ -121,6 +145,10 @@ configure_pytorch_memory()
 # Constants
 # =============================================================================
 
+DEFAULT_OUTPUT_CSV = "data/orienternet_results.csv"
+DEFAULT_OUTPUT_ARTIFACTS_DIR = "data/image_outputs"
+DEFAULT_RUNS_DIR = "data/runs"
+
 CSV_HEADERS = [
     "image_id",
     "image_path",
@@ -128,12 +156,21 @@ CSV_HEADERS = [
     "gt_latitude",
     "gt_longitude",
     "gt_yaw",
+    "src_latitude",
+    "src_longitude",
+    "src_yaw",
     "pred_latitude",
     "pred_longitude",
     "pred_x_meters",
     "pred_y_meters",
     "pred_yaw",
     "pred_probability",
+    "exif_make",
+    "exif_model",
+    "exif_focal_35mm",
+    "exif_focal_ratio",
+    "exif_orientation",
+    "exif_altitude",
     "error_message",
 ]
 
@@ -163,6 +200,29 @@ class ProcessorConfig:
     num_rotations: int = 128
     device: str = "cuda"
     save_artifacts: bool = False
+
+
+# =============================================================================
+# Run naming helpers
+# =============================================================================
+
+def sanitize_run_label(value: str) -> str:
+    """Return a filesystem-safe run label component."""
+    cleaned = value.strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", cleaned)
+    cleaned = cleaned.strip("._-")
+    return cleaned or "data"
+
+
+def build_run_name(tile_size: int, num_rotations: int, data_version: str) -> str:
+    """Build a readable run name from processing parameters.
+
+    Example:
+        process_272t_256r_h5v
+    """
+    clean_version = sanitize_run_label(data_version)
+    return f"process_{tile_size}t_{num_rotations}r_{clean_version}"
 
 
 # =============================================================================
@@ -497,6 +557,10 @@ class ImageProcessor:
         """Process one image and return one CSV row."""
         result = self._empty_result_row(image_id, image_path)
 
+        # Extract EXIF data from image
+        exif_data = self._extract_exif_metadata(image_path)
+        result.update(exif_data)
+
         ground_truth = h5_metadata.get(image_id)
 
         if ground_truth is None:
@@ -505,6 +569,10 @@ class ImageProcessor:
         else:
             self._add_ground_truth_to_result(result, ground_truth)
             prior_latlon = (ground_truth.latitude, ground_truth.longitude)
+            # Store source position (from h5)
+            result["src_latitude"] = ground_truth.latitude
+            result["src_longitude"] = ground_truth.longitude
+            result["src_yaw"] = ground_truth.yaw
 
         try:
             image, camera, gravity, proj, bbox = self.demo.read_input_image(
@@ -616,21 +684,32 @@ class ImageProcessor:
         camera: Any,
         raster: np.ndarray,
     ) -> None:
+        # Save to data/runs/image_<id> directory as primary location
         folder = self.config.output_artifacts_dir / f"image_{image_id}"
         folder.mkdir(parents=True, exist_ok=True)
 
-        np.save(folder / "neural_map.npy", neural_map.detach().cpu().numpy())
-        np.save(folder / "prediction_prob.npy", prob.detach().cpu().numpy())
+        # Save prediction maps (probability map) 
+        prediction_map = prob.detach().cpu().numpy()
+        np.save(folder / "prediction_map.npy", prediction_map)
+        
+        # Save neural map features
+        neural_map_np = neural_map.detach().cpu().numpy()
+        np.save(folder / "neural_map.npy", neural_map_np)
 
+        # Save rectified image
         rectified_image = self._tensor_to_uint8_image(image_rectified)
-        Image.fromarray(rectified_image).save(folder / "rectified_image.png")
+        Image.fromarray(rectified_image).save(folder / "rectified_image.jpg")
 
+        # Save camera metadata
         camera_dict = self._camera_to_dict(camera)
         with (folder / "camera.json").open("w", encoding="utf-8") as f:
             json.dump(camera_dict, f, indent=2)
 
+        # Save OSM visualization
         rgb = Colormap.apply(raster)
-        Image.fromarray((rgb * 255).astype(np.uint8)).save(folder / "osm.png")
+        Image.fromarray((rgb * 255).astype(np.uint8)).save(folder / "osm.jpg")
+
+        logger.info("Artifacts saved for image %d to %s", image_id, folder)
 
     @staticmethod
     def _tensor_to_uint8_image(image_tensor: Any) -> np.ndarray:
@@ -656,6 +735,43 @@ class ImageProcessor:
             "dist": camera.dist.detach().cpu().tolist(),
         }
 
+    @staticmethod
+    def _extract_exif_metadata(image_path: Path) -> Dict[str, Any]:
+        """Extract EXIF metadata from image file."""
+        exif_data = {
+            "exif_make": "",
+            "exif_model": "",
+            "exif_focal_35mm": np.nan,
+            "exif_focal_ratio": np.nan,
+            "exif_orientation": np.nan,
+            "exif_altitude": np.nan,
+        }
+
+        try:
+            with open(image_path, "rb") as fid:
+                exif = EXIF(fid, lambda: None)
+
+                # Extract make and model
+                exif_data["exif_make"] = exif.extract_make()
+                exif_data["exif_model"] = exif.extract_model()
+
+                # Extract focal lengths
+                focal_35mm, focal_ratio = exif.extract_focal()
+                exif_data["exif_focal_35mm"] = float(focal_35mm) if focal_35mm else np.nan
+                exif_data["exif_focal_ratio"] = float(focal_ratio) if focal_ratio else np.nan
+
+                # Extract orientation
+                exif_data["exif_orientation"] = float(exif.extract_orientation())
+
+                # Extract altitude
+                altitude = exif.extract_altitude()
+                exif_data["exif_altitude"] = float(altitude) if altitude else np.nan
+
+        except Exception as exc:
+            logger.warning("Failed to extract EXIF data from %s: %s", image_path, exc)
+
+        return exif_data
+
     # -------------------------------------------------------------------------
     # Result row helpers
     # -------------------------------------------------------------------------
@@ -673,12 +789,21 @@ class ImageProcessor:
             "gt_latitude": np.nan,
             "gt_longitude": np.nan,
             "gt_yaw": np.nan,
+            "src_latitude": np.nan,
+            "src_longitude": np.nan,
+            "src_yaw": np.nan,
             "pred_latitude": np.nan,
             "pred_longitude": np.nan,
             "pred_x_meters": np.nan,
             "pred_y_meters": np.nan,
             "pred_yaw": np.nan,
             "pred_probability": np.nan,
+            "exif_make": "",
+            "exif_model": "",
+            "exif_focal_35mm": np.nan,
+            "exif_focal_ratio": np.nan,
+            "exif_orientation": np.nan,
+            "exif_altitude": np.nan,
             "error_message": "",
         }
 
@@ -785,14 +910,44 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--output-csv",
-        default="data/orienternet_results.csv",
-        help="Output CSV file path.",
+        default=DEFAULT_OUTPUT_CSV,
+        help=(
+            "Output CSV file path. If left as the default, the file is written "
+            "inside the generated run directory as results.csv."
+        ),
     )
 
     parser.add_argument(
         "--output-artifacts-dir",
-        default="data/image_outputs",
-        help="Directory for per-image output artifacts.",
+        default=DEFAULT_OUTPUT_ARTIFACTS_DIR,
+        help=(
+            "Directory for per-image output artifacts. If left as the default, "
+            "artifacts are written inside the generated run directory."
+        ),
+    )
+
+    parser.add_argument(
+        "--runs-dir",
+        default=DEFAULT_RUNS_DIR,
+        help="Base directory for named runs. Default: data/runs",
+    )
+
+    parser.add_argument(
+        "--data-version",
+        default="h5v",
+        help=(
+            "Short version label for the H5/data source. Used in automatic "
+            "run names, e.g. h5v."
+        ),
+    )
+
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Optional custom run name. If omitted, a name is generated from "
+            "tile size, rotations, and data version, e.g. process_272t_256r_h5v."
+        ),
     )
 
     parser.add_argument(
@@ -878,11 +1033,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> ProcessorConfig:
+    run_name = args.run_name or build_run_name(
+        tile_size=args.tile_size,
+        num_rotations=args.num_rotations,
+        data_version=args.data_version,
+    )
+
+    run_dir = Path(args.runs_dir) / run_name
+
+    output_csv = Path(args.output_csv)
+    output_artifacts_dir = Path(args.output_artifacts_dir)
+
+    # If the user left output paths at the defaults, place outputs inside
+    # the parameter-based run folder. If the user explicitly passed custom
+    # paths, respect those paths exactly.
+    if args.output_csv == DEFAULT_OUTPUT_CSV:
+        output_csv = run_dir / "results.csv"
+
+    if args.output_artifacts_dir == DEFAULT_OUTPUT_ARTIFACTS_DIR:
+        output_artifacts_dir = run_dir / "artifacts"
+
+    logger.info("Run name: %s", run_name)
+    logger.info("Run directory: %s", run_dir)
+    logger.info("Output CSV: %s", output_csv)
+    logger.info("Output artifacts directory: %s", output_artifacts_dir)
+
     return ProcessorConfig(
         h5_path=Path(args.h5),
         images_dir=Path(args.images_dir),
-        output_csv=Path(args.output_csv),
-        output_artifacts_dir=Path(args.output_artifacts_dir),
+        output_csv=output_csv,
+        output_artifacts_dir=output_artifacts_dir,
         tile_size_meters=args.tile_size,
         num_rotations=args.num_rotations,
         device=args.device,
