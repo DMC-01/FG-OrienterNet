@@ -496,7 +496,7 @@ class ImageProcessor:
     # Image discovery: manifest or extracted image_<id> fallback
     # -------------------------------------------------------------------------
 
-    def load_image_manifest(self) -> Dict[int, Path]:
+    def load_image_manifest(self) -> Dict[str, Path]:
         """
         Load image paths from a CSV with columns:
             id, relative_image_path
@@ -507,7 +507,7 @@ class ImageProcessor:
         The configured prefix, by default 'mapillary_dataset/', is stripped,
         and the remaining path is resolved relative to images_dir_original.
         """
-        image_paths: Dict[int, Path] = {}
+        image_paths: Dict[str, Path] = {}
 
         if self.config.image_manifest_csv is None:
             return image_paths
@@ -537,14 +537,14 @@ class ImageProcessor:
                 )
 
             for row in reader:
-                image_id = self._safe_int(row.get("id"))
+                dataset_id = str(row.get("id") or "").strip()
                 relative_image_path = (row.get("relative_image_path") or "").strip()
 
-                if image_id is None or not relative_image_path:
+                if not dataset_id or not relative_image_path:
                     continue
 
                 normalized_path = self._normalize_manifest_relative_path(relative_image_path)
-                image_paths[image_id] = base_dir / Path(normalized_path)
+                image_paths[dataset_id] = base_dir / Path(normalized_path)
 
         logger.info("Loaded %d image paths from manifest", len(image_paths))
         return image_paths
@@ -561,7 +561,7 @@ class ImageProcessor:
 
         return normalized
 
-    def find_local_images(self) -> Dict[int, Path]:
+    def find_local_images(self, h5_metadata: Optional[Dict[int, GroundTruthMetadata]] = None,) -> Dict[int, Path]:
         """
         Find local images.
 
@@ -572,32 +572,43 @@ class ImageProcessor:
             image_<id>.jpg/png/jpeg in --images-dir or --images-dir-original.
         """
         if self.config.image_manifest_csv is not None:
-            image_paths = self.load_image_manifest()
+            manifest_paths_by_dataset_id = self.load_image_manifest()
+
+            if h5_metadata is None:
+                h5_metadata = self.load_h5_metadata()
+
+            image_paths_by_h5_id: Dict[int, Path] = {}
+
+            for image_id, metadata in h5_metadata.items():
+                dataset_id = self._normalize_dataset_id(metadata.id_dataset)
+
+                image_path = manifest_paths_by_dataset_id.get(dataset_id)
+
+                if image_path is not None:
+                    image_paths_by_h5_id[image_id] = image_path
 
             existing_image_paths = {
                 image_id: image_path
-                for image_id, image_path in image_paths.items()
+                for image_id, image_path in image_paths_by_h5_id.items()
                 if image_path.exists()
             }
 
-            missing_count = len(image_paths) - len(existing_image_paths)
+            missing_count = len(image_paths_by_h5_id) - len(existing_image_paths)
 
-            logger.info("Found %d existing images from manifest", len(existing_image_paths))
+            logger.info(
+                "Matched %d H5 entries to manifest image paths",
+                len(image_paths_by_h5_id),
+            )
+            logger.info(
+                "Found %d existing images from manifest",
+                len(existing_image_paths),
+            )
 
             if missing_count:
                 logger.warning(
-                    "Manifest referenced %d images that do not exist on disk",
+                    "Matched manifest referenced %d images that do not exist on disk",
                     missing_count,
                 )
-
-                # Print a few examples to make path bugs easy to diagnose.
-                shown = 0
-                for image_id, image_path in image_paths.items():
-                    if not image_path.exists():
-                        logger.warning("Missing manifest image example: id=%s path=%s", image_id, image_path)
-                        shown += 1
-                        if shown >= 5:
-                            break
 
             return existing_image_paths
 
@@ -673,7 +684,7 @@ class ImageProcessor:
             failed_ids = self.load_failed_image_ids()
             processed_ids -= failed_ids
 
-        local_images_by_id = self.find_local_images()
+        local_images_by_id = self.find_local_images(h5_metadata=h5_metadata)
 
         before_h5_filter = len(local_images_by_id)
         local_images_by_id = {
@@ -1136,6 +1147,22 @@ class ImageProcessor:
         if isinstance(value, bytes):
             return value.decode("utf-8")
         return str(value)
+
+    @staticmethod
+    def _normalize_dataset_id(value: Any) -> str:
+        """
+        Normalize dataset IDs for matching.
+
+        Example:
+            mapillary:475541626839824 -> 475541626839824
+            475541626839824           -> 475541626839824
+        """
+        text = ImageProcessor._decode_h5_value(value).strip()
+
+        if ":" in text:
+            text = text.split(":", 1)[1]
+
+        return text.strip()
 
     @staticmethod
     def _safe_int(value: Any) -> Optional[int]:
