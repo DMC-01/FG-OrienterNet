@@ -1,0 +1,13 @@
+Metric,Value
+Distance MAE (m),155.55
+Distance RMSE (m),171.58
+Distance Median (m),168.50
+Distance 90th percentile (m),242.92
+Yaw MAE (°),85.13
+Yaw RMSE (°),103.28
+Yaw Median (°),83.64
+Yaw 90th percentile (°),168.40
+Total Rows Loaded,26613
+Valid Predictions Analyzed,26613
+Excluded Rows,0
+Mean Quality Score,44.47

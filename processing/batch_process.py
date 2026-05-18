@@ -1,509 +1,929 @@
 #!/usr/bin/env python3
+
 """
-Process images from extracted local files and run through OrienterNet pipeline.
-Maps images to H5 metadata and saves results to CSV incrementally.
+Run OrienterNet localization on extracted images and export predictions to CSV.
+
+Expected project structure:
+
+    FG-OrienterNet/
+    ├── maploc/
+    ├── processing/
+    │   └── batch_process.py
+    └── data/
+        ├── bern_ground_all.h5
+        └── extracted_images/
+            ├── image_0.jpg
+            ├── image_1.jpg
+            └── ...
+
+Expected image names:
+    image_<id>.jpg
+    image_<id>.png
+
+Expected H5 metadata structure:
+    metadata/id
+    metadata/id_dataset
+    metadata/latitude
+    metadata/longitude
+    metadata/yaw
 """
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# =============================================================================
+# Project import setup
+# =============================================================================
+
+# batch_process.py is inside:
+#   FG-OrienterNet/processing/batch_process.py
+# so parents[1] is:
+#   FG-OrienterNet/
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Set CUDA allocator config BEFORE importing torch.
+# On Windows, expandable_segments may not be supported, so use max_split_size_mb.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+
+
+# =============================================================================
+# Imports
+# =============================================================================
 
 import argparse
 import csv
-import h5py
+import json
 import logging
-import os
-import sys
 import traceback
-from pathlib import Path
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Set
 
+import h5py
 import numpy as np
+import torch
+from PIL import Image
 
 from maploc.demo import Demo
 from maploc.osm.tiling import TileManager
-from maploc.utils.geo import BoundaryBox
+from maploc.osm.viz import Colormap
 
-# Setup logging
+
+# =============================================================================
+# Logging
+# =============================================================================
+
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# PyTorch configuration
+# =============================================================================
+
+def configure_pytorch_memory() -> None:
+    """Configure PyTorch runtime behavior."""
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+    logger.info(
+        "PyTorch CUDA allocator config: %s",
+        os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+    )
+
+    if torch.cuda.is_available():
+        logger.info("CUDA available: True")
+        logger.info("CUDA device count: %d", torch.cuda.device_count())
+
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            logger.info(
+                "GPU %d: %s, %.2f GB VRAM",
+                idx,
+                props.name,
+                props.total_memory / 1024**3,
+            )
+    else:
+        logger.info("CUDA available: False")
+
+
+configure_pytorch_memory()
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+CSV_HEADERS = [
+    "image_id",
+    "image_path",
+    "h5_id_dataset",
+    "gt_latitude",
+    "gt_longitude",
+    "gt_yaw",
+    "pred_latitude",
+    "pred_longitude",
+    "pred_x_meters",
+    "pred_y_meters",
+    "pred_yaw",
+    "pred_probability",
+    "error_message",
+]
+
+# OrienterNet OSM raster layer limits.
+RASTER_LAYER_MAX_VALUES = [7, 10, 33]
+
+
+# =============================================================================
+# Data models
+# =============================================================================
+
+@dataclass
+class GroundTruthMetadata:
+    id_dataset: str
+    latitude: float
+    longitude: float
+    yaw: float
+
+
+@dataclass
+class ProcessorConfig:
+    h5_path: Path
+    images_dir: Path
+    output_csv: Path
+    output_artifacts_dir: Path
+    tile_size_meters: int = 64
+    num_rotations: int = 128
+    device: str = "cuda"
+    save_artifacts: bool = False
+
+
+# =============================================================================
+# Main processor
+# =============================================================================
+
 class ImageProcessor:
-    """Process images through OrienterNet and save results to CSV."""
+    def __init__(self, config: ProcessorConfig):
+        self.config = config
 
-    def __init__(
-        self,
-        h5_path: str,
-        images_dir: str,
-        output_csv: str,
-        tile_size_meters: int = 64,
-        num_rotations: int = 256,
-    ):
-        """
-        Initialize processor.
+        device = torch.device(config.device)
 
-        Args:
-            h5_path: Path to H5 file with metadata
-            images_dir: Directory containing local images
-            output_csv: Path to output CSV file
-            tile_size_meters: Tile size for map queries
-            num_rotations: Number of rotation hypotheses
-        """
-        self.h5_path = h5_path
-        self.images_dir = Path(images_dir)
-        self.output_csv = output_csv
-        self.tile_size_meters = tile_size_meters
-        self.num_rotations = num_rotations
+        if device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA was requested, but torch.cuda.is_available() is False."
+                )
 
-        # Load demo model
-        logger.info("Loading OrienterNet model...")
-        self.demo = Demo(num_rotations=num_rotations)
-        logger.info("Model loaded successfully")
+            torch.cuda.set_device(device)
 
-        # CSV headers
-        self.csv_headers = [
-            'image_id',
-            'image_path',
-            'h5_id_dataset',
-            'gt_latitude',
-            'gt_longitude',
-            'gt_yaw',
-            'pred_latitude',
-            'pred_longitude',
-            'pred_x_meters',
-            'pred_y_meters',
-            'pred_yaw',
-            'error_message',
-        ]
+            logger.info("Set active CUDA device to %s", device)
+            logger.info("CUDA current device index: %d", torch.cuda.current_device())
+            logger.info("CUDA device name: %s", torch.cuda.get_device_name(device))
 
-        # Initialize CSV file if it doesn't exist
+        logger.info("Loading OrienterNet model on %s...", device)
+
+        self.demo = Demo(
+            num_rotations=config.num_rotations,
+            device=device,
+        )
+
+        logger.info("Model loaded successfully on %s", device)
+        logger.info("Demo device: %s", self.demo.device)
+
         self._init_csv()
 
-    def _init_csv(self):
-        """Initialize CSV file with headers."""
-        if not os.path.exists(self.output_csv):
-            logger.info(f"Creating new CSV file: {self.output_csv}")
-            with open(self.output_csv, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.csv_headers)
-                writer.writeheader()
+    # -------------------------------------------------------------------------
+    # GPU memory management
+    # -------------------------------------------------------------------------
 
-    def _append_to_csv(self, row: Dict):
-        """Append a single row to the CSV file."""
+    @staticmethod
+    def _cleanup_gpu_memory() -> None:
+        """Clear CUDA cache after each image."""
         try:
-            with open(self.output_csv, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.csv_headers)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.debug("GPU cache cleanup failed: %s", exc)
+
+    # -------------------------------------------------------------------------
+    # CSV helpers
+    # -------------------------------------------------------------------------
+
+    def _init_csv(self) -> None:
+        """Create output CSV if it does not already exist."""
+        if self.config.output_csv.exists():
+            return
+
+        logger.info("Creating CSV file: %s", self.config.output_csv)
+        self.config.output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.config.output_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            writer.writeheader()
+
+    def _append_csv_row(self, row: Dict[str, Any]) -> None:
+        """Append one result row to CSV."""
+        try:
+            with self.config.output_csv.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writerow(row)
-        except Exception as e:
-            logger.error(f"Failed to write to CSV: {e}")
+        except Exception as exc:
+            logger.error("Failed to append row to CSV: %s", exc)
 
-    def _update_csv_row(self, image_id: int, new_row: Dict):
-        """Update an existing CSV row by image_id."""
+    def _replace_csv_row(self, image_id: int, new_row: Dict[str, Any]) -> None:
+        """Replace existing CSV row for one image id."""
         try:
-            # Read all rows
             rows = []
-            with open(self.output_csv, 'r', newline='', encoding='utf-8') as f:
+
+            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
+
                 for row in reader:
-                    if int(row.get('image_id', -1)) == image_id:
-                        # Replace this row with the new data
+                    current_id = self._safe_int(row.get("image_id"))
+
+                    if current_id == image_id:
                         rows.append(new_row)
                     else:
                         rows.append(row)
 
-            # Write all rows back
-            with open(self.output_csv, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.csv_headers)
+            with self.config.output_csv.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writeheader()
                 writer.writerows(rows)
-        except Exception as e:
-            logger.error(f"Failed to update CSV row for image {image_id}: {e}")
 
-    def _load_h5_metadata(self) -> Dict:
-        """Load all metadata from H5 file indexed by image ID."""
-        logger.info(f"Loading metadata from {self.h5_path}...")
-        metadata = {}
+        except Exception as exc:
+            logger.error("Failed to update CSV row for image %s: %s", image_id, exc)
 
-        with h5py.File(self.h5_path, 'r') as f:
-            h5_ids = f['metadata']['id'][:]
-            id_datasets = f['metadata']['id_dataset'][:]
-            latitudes = f['metadata']['latitude'][:]
-            longitudes = f['metadata']['longitude'][:]
-            yaws = f['metadata']['yaw'][:]
+    # -------------------------------------------------------------------------
+    # H5 metadata
+    # -------------------------------------------------------------------------
+
+    def load_h5_metadata(self) -> Dict[int, GroundTruthMetadata]:
+        """Load ground-truth metadata from the H5 file."""
+        logger.info("Loading metadata from %s", self.config.h5_path)
+
+        if not self.config.h5_path.exists():
+            raise FileNotFoundError(f"H5 file not found: {self.config.h5_path}")
+
+        metadata: Dict[int, GroundTruthMetadata] = {}
+
+        with h5py.File(self.config.h5_path, "r") as f:
+            h5_ids = f["metadata"]["id"][:]
+            id_datasets = f["metadata"]["id_dataset"][:]
+            latitudes = f["metadata"]["latitude"][:]
+            longitudes = f["metadata"]["longitude"][:]
+            yaws = f["metadata"]["yaw"][:]
 
             for idx, h5_id in enumerate(h5_ids):
-                metadata[int(h5_id)] = {
-                    'id_dataset': id_datasets[idx].decode('utf-8') if isinstance(id_datasets[idx], bytes) else id_datasets[idx],
-                    'latitude': float(latitudes[idx]),
-                    'longitude': float(longitudes[idx]),
-                    'yaw': float(yaws[idx]),
-                }
+                image_id = int(h5_id)
+                id_dataset = self._decode_h5_value(id_datasets[idx])
 
-        logger.info(f"Loaded metadata for {len(metadata)} images from H5")
+                metadata[image_id] = GroundTruthMetadata(
+                    id_dataset=id_dataset,
+                    latitude=float(latitudes[idx]),
+                    longitude=float(longitudes[idx]),
+                    yaw=float(yaws[idx]),
+                )
+
+        logger.info("Loaded metadata for %d images", len(metadata))
         return metadata
 
-    def _load_processed_image_ids(self) -> set:
-        """Load image IDs already processed from results CSV file."""
-        processed_ids = set()
+    # -------------------------------------------------------------------------
+    # Processed / retry state
+    # -------------------------------------------------------------------------
 
-        if not os.path.exists(self.output_csv):
+    def load_processed_image_ids(self) -> Set[int]:
+        """Return image IDs already present in the output CSV."""
+        processed_ids: Set[int] = set()
+
+        if not self.config.output_csv.exists():
             return processed_ids
 
         try:
-            with open(self.output_csv, 'r', newline='', encoding='utf-8') as f:
+            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
+
                 for row in reader:
-                    if row.get('image_id'):
-                        processed_ids.add(int(row['image_id']))
-            logger.info(f"Found {len(processed_ids)} already processed images in {self.output_csv}")
-        except Exception as e:
-            logger.warning(f"Could not read existing CSV file: {e}")
+                    image_id = self._safe_int(row.get("image_id"))
+                    if image_id is not None:
+                        processed_ids.add(image_id)
+
+            logger.info("Found %d already processed images", len(processed_ids))
+
+        except Exception as exc:
+            logger.warning("Could not read existing CSV: %s", exc)
 
         return processed_ids
 
-    def _get_failed_image_ids(self) -> set:
-        """Identify image IDs with errors (KeyError or NaN predictions) for retry."""
-        failed_ids = set()
+    def load_failed_image_ids(self) -> Set[int]:
+        """
+        Return image IDs that should be retried.
 
-        if not os.path.exists(self.output_csv):
+        Retry criteria:
+        - error_message contains KeyError
+        - prediction coordinates are missing or NaN
+        """
+        failed_ids: Set[int] = set()
+
+        if not self.config.output_csv.exists():
             return failed_ids
 
         try:
-            with open(self.output_csv, 'r', newline='', encoding='utf-8') as f:
+            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
+
                 for row in reader:
-                    if not row.get('image_id'):
+                    image_id = self._safe_int(row.get("image_id"))
+                    if image_id is None:
                         continue
 
-                    image_id = int(row['image_id'])
-                    error_msg = row.get('error_message', '')
-
-                    # Retry if KeyError in message or if prediction values are NaN
-                    if 'KeyError' in error_msg:
+                    if self._row_should_be_retried(row):
                         failed_ids.add(image_id)
-                        logger.debug(f"Marking image {image_id} for retry due to KeyError: {error_msg}")
-                    elif not error_msg or error_msg == '':
-                        # Check if prediction values are NaN (successful computation)
-                        try:
-                            pred_x = row.get('pred_x_meters', '')
-                            pred_y = row.get('pred_y_meters', '')
-                            if pred_x in ('nan', '') or pred_y in ('nan', ''):
-                                # Try to parse - if it's "nan" string, mark for retry
-                                if pred_x in ('nan', '') and pred_y in ('nan', ''):
-                                    failed_ids.add(image_id)
-                                    logger.debug(f"Marking image {image_id} for retry due to NaN predictions")
-                        except Exception:
-                            pass
 
             if failed_ids:
-                logger.info(f"Found {len(failed_ids)} failed images to retry (KeyError or NaN)")
-        except Exception as e:
-            logger.warning(f"Could not read failed images from CSV: {e}")
+                logger.info("Found %d failed images to retry", len(failed_ids))
+
+        except Exception as exc:
+            logger.warning("Could not read failed images from CSV: %s", exc)
 
         return failed_ids
 
-    def _find_local_image(self, image_id: int) -> Optional[Path]:
-        """Find local image file for given image ID."""
-        # Try different naming patterns
-        patterns = [
-            f"image_{image_id}.jpg",
-            f"image_{image_id}.png",
-            f"{image_id}.jpg",
-            f"{image_id}.png",
+    @staticmethod
+    def _row_should_be_retried(row: Dict[str, str]) -> bool:
+        error_message = row.get("error_message", "") or ""
+
+        if "KeyError" in error_message:
+            return True
+
+        pred_x = row.get("pred_x_meters", "")
+        pred_y = row.get("pred_y_meters", "")
+
+        return (
+            ImageProcessor._is_missing_number(pred_x)
+            or ImageProcessor._is_missing_number(pred_y)
+        )
+
+    # -------------------------------------------------------------------------
+    # Image discovery
+    # -------------------------------------------------------------------------
+
+    def find_local_images(self) -> list[Path]:
+        """Find local image files matching image_*.jpg or image_*.png."""
+        logger.info("Scanning for images in %s", self.config.images_dir)
+
+        if not self.config.images_dir.exists():
+            raise FileNotFoundError(f"Images directory not found: {self.config.images_dir}")
+
+        jpg_images = sorted(self.config.images_dir.glob("image_*.jpg"))
+        png_images = sorted(self.config.images_dir.glob("image_*.png"))
+
+        images = jpg_images + png_images
+
+        logger.info("Found %d images", len(images))
+        return images
+
+    @staticmethod
+    def get_image_id(image_path: Path) -> int:
+        """Extract image id from filename like image_123.jpg."""
+        return int(image_path.stem.replace("image_", ""))
+
+    # -------------------------------------------------------------------------
+    # Main processing
+    # -------------------------------------------------------------------------
+
+    def process_all_images(
+        self,
+        max_images: Optional[int] = None,
+        retry_failed: bool = True,
+        worker_id: int = 0,
+        num_workers: int = 1,
+    ) -> None:
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1.")
+
+        if worker_id < 0 or worker_id >= num_workers:
+            raise ValueError(
+                f"worker_id must be between 0 and num_workers - 1. "
+                f"Got worker_id={worker_id}, num_workers={num_workers}."
+            )
+
+        h5_metadata = self.load_h5_metadata()
+        processed_ids = self.load_processed_image_ids()
+
+        failed_ids: Set[int] = set()
+
+        if retry_failed:
+            failed_ids = self.load_failed_image_ids()
+            processed_ids -= failed_ids
+
+        local_images = self.find_local_images()
+
+        # Shard images by worker id.
+        # Example with num_workers=2:
+        #   worker 0 processes IDs where image_id % 2 == 0
+        #   worker 1 processes IDs where image_id % 2 == 1
+        local_images = [
+            image_path
+            for image_path in local_images
+            if self.get_image_id(image_path) % num_workers == worker_id
         ]
 
-        for pattern in patterns:
-            image_path = self.images_dir / pattern
-            if image_path.exists():
-                return image_path
-
-        return None
-
-    def _process_single_image(
-        self,
-        image_id: int,
-        image_path: Path,
-        h5_metadata: Dict,
-    ) -> Dict:
-        """
-        Process a single image through the pipeline.
-
-        Returns:
-            Dictionary with results or error message
-        """
-        result = {
-            'image_id': image_id,
-            'image_path': str(image_path.relative_to(self.images_dir.parent)),
-            'h5_id_dataset': '',
-            'gt_latitude': np.nan,
-            'gt_longitude': np.nan,
-            'gt_yaw': np.nan,
-            'pred_latitude': np.nan,
-            'pred_longitude': np.nan,
-            'pred_x_meters': np.nan,
-            'pred_y_meters': np.nan,
-            'pred_yaw': np.nan,
-            'error_message': '',
-        }
-
-        # Add ground truth from H5 if available
-        if image_id in h5_metadata:
-            result['h5_id_dataset'] = h5_metadata[image_id]['id_dataset']
-            result['gt_latitude'] = h5_metadata[image_id]['latitude']
-            result['gt_longitude'] = h5_metadata[image_id]['longitude']
-            result['gt_yaw'] = h5_metadata[image_id]['yaw']
-            prior_latlon = (
-                h5_metadata[image_id]['latitude'],
-                h5_metadata[image_id]['longitude']
-            )
-        else:
-            result['error_message'] = "No ground truth metadata found in H5"
-            prior_latlon = None
-
-        try:
-            # Read and calibrate input image
-            logger.info(f"Processing image {image_id}: {image_path.name}")
-            image, camera, gravity, proj, bbox = self.demo.read_input_image(
-                str(image_path),
-                prior_latlon=prior_latlon,
-                tile_size_meters=self.tile_size_meters,
-            )
-
-            # Query OSM map tile
-            tiler = TileManager.from_bbox(
-                proj,
-                bbox + 10,
-                self.demo.config.data.pixel_per_meter
-            )
-            canvas = tiler.query(bbox)
-
-            # Debug: Check raster values
-            raster = canvas.raster
-            logger.debug(f"Raster shape: {raster.shape}, dtype: {raster.dtype}")
-            logger.debug(f"Raster value ranges: areas={raster[0].min()}-{raster[0].max()}, ways={raster[1].min()}-{raster[1].max()}, nodes={raster[2].min()}-{raster[2].max()}")
-
-            # Clamp raster values to valid ranges to prevent KeyError
-            # areas: 0-7, ways: 0-10, nodes: 0-33
-            max_values = [7, 10, 33]
-            for i, max_val in enumerate(max_values):
-                invalid_mask = raster[i] > max_val
-                if invalid_mask.any():
-                    logger.warning(f"Clamping {invalid_mask.sum()} invalid values in layer {i} (max allowed: {max_val})")
-                    raster[i] = np.clip(raster[i], 0, max_val)
-
-            # Run localization
-            uv, yaw, prob, neural_map, image_rectified = self.demo.localize(
-                image, camera, canvas, gravity=gravity
-            )
-
-            # Convert UV to XY coordinates
-            xy = canvas.to_xy(uv)  # This gives projected coordinates (x, y in meters)
-            latlon = proj.unproject(xy)  # This gives geographic coordinates (lat, lon)
-
-            # Store both projected and geographic coordinates
-            result['pred_x_meters'] = float(xy[0])
-            result['pred_y_meters'] = float(xy[1])
-            result['pred_latitude'] = float(latlon[0])
-            result['pred_longitude'] = float(latlon[1])
-            result['pred_yaw'] = float(yaw.numpy())
-
-            logger.info(
-                f"Successfully processed image {image_id}: "
-                f"xy_meters=({result['pred_x_meters']:.2f}, {result['pred_y_meters']:.2f}), "
-                f"latlon=({result['pred_latitude']:.6f}, {result['pred_longitude']:.6f}), "
-                f"yaw={result['pred_yaw']:.2f}°"
-            )
-
-        except Exception as e:
-            error_msg = f"{type(e).__name__}: {str(e)}"
-            result['error_message'] = error_msg
-            logger.error(f"Error processing image {image_id}: {error_msg}")
-            logger.debug(traceback.format_exc())
-
-        return result
-
-    def process_all_images(self, max_images: Optional[int] = None, retry_failed: bool = True):
-        """
-        Process all images and save results.
-
-        Args:
-            max_images: Maximum number of images to process (None for all)
-            retry_failed: Whether to retry images with KeyError or NaN predictions
-        """
-        # Load H5 metadata
-        h5_metadata = self._load_h5_metadata()
-
-        # Load already processed image IDs
-        processed_ids = self._load_processed_image_ids()
-
-        # Get failed image IDs if retry is enabled
-        failed_ids = set()
-        if retry_failed:
-            failed_ids = self._get_failed_image_ids()
-            # Remove failed images from processed set so they get reprocessed
-            processed_ids = processed_ids - failed_ids
-
-        # Find all local images
-        logger.info(f"Scanning for local images in {self.images_dir}...")
-        local_images = sorted(self.images_dir.glob("image_*.jpg"))
-        if not local_images:
-            local_images = sorted(self.images_dir.glob("image_*.png"))
-
-        logger.info(f"Found {len(local_images)} local images")
-
-        # Filter out already processed images
-        images_to_process = []
-        for image_path in local_images:
-            image_id = int(image_path.stem.replace('image_', ''))
-            if image_id not in processed_ids:
-                images_to_process.append(image_path)
+        images_to_process = [
+            image_path
+            for image_path in local_images
+            if self.get_image_id(image_path) not in processed_ids
+        ]
 
         skipped_count = len(local_images) - len(images_to_process)
-        if skipped_count > 0:
-            logger.info(f"Skipping {skipped_count} already processed images")
-
-        logger.info(f"Processing {len(images_to_process)} new images")
-        if failed_ids:
-            logger.info(f"  Including {len(failed_ids)} failed images for retry")
 
         if max_images is not None:
             images_to_process = images_to_process[:max_images]
 
-        # Process each image
-        for idx, image_path in enumerate(images_to_process, 1):
-            # Extract image ID from filename
-            image_id = int(image_path.stem.replace('image_', ''))
+        logger.info(
+            "Worker %d/%d processing %d images",
+            worker_id,
+            num_workers,
+            len(images_to_process),
+        )
 
-            is_retry = image_id in failed_ids
-            retry_label = " (RETRY)" if is_retry else ""
-            logger.info(f"\n[{idx}/{len(images_to_process)}] Processing {image_path.name}{retry_label}...")
+        if skipped_count:
+            logger.info("Skipped already processed images: %d", skipped_count)
 
-            # Process image
-            result = self._process_single_image(image_id, image_path, h5_metadata)
-
-            # For retries, update the existing row instead of appending
-            if is_retry:
-                self._update_csv_row(image_id, result)
-                logger.info(f"Updated result for retry image {image_id} in {self.output_csv}")
-            else:
-                # Save to CSV (incremental)
-                self._append_to_csv(result)
-                logger.info(f"Saved result to {self.output_csv}")
-
-        logger.info(f"\nProcessing complete! Results saved to {self.output_csv}")
-        if skipped_count > 0:
-            logger.info(f"Summary: {len(images_to_process)} new images processed, {skipped_count} images skipped")
         if failed_ids:
-            logger.info(f"         {len(failed_ids)} failed images were retried")
+            logger.info("Retrying failed images: %d", len(failed_ids))
 
-    def get_summary_stats(self):
-        """Print summary statistics from CSV file."""
+        for index, image_path in enumerate(images_to_process, start=1):
+            image_id = self.get_image_id(image_path)
+            is_retry = image_id in failed_ids
+
+            logger.info(
+                "[%d/%d] Processing %s%s",
+                index,
+                len(images_to_process),
+                image_path.name,
+                " [retry]" if is_retry else "",
+            )
+
+            result = self.process_single_image(
+                image_id=image_id,
+                image_path=image_path,
+                h5_metadata=h5_metadata,
+            )
+
+            if is_retry:
+                self._replace_csv_row(image_id, result)
+            else:
+                self._append_csv_row(result)
+
+        logger.info(
+            "Worker %d processing complete. Results saved to %s",
+            worker_id,
+            self.config.output_csv,
+        )
+
+    def process_single_image(
+        self,
+        image_id: int,
+        image_path: Path,
+        h5_metadata: Dict[int, GroundTruthMetadata],
+    ) -> Dict[str, Any]:
+        """Process one image and return one CSV row."""
+        result = self._empty_result_row(image_id, image_path)
+
+        ground_truth = h5_metadata.get(image_id)
+
+        if ground_truth is None:
+            result["error_message"] = "No ground truth metadata found in H5"
+            prior_latlon = None
+        else:
+            self._add_ground_truth_to_result(result, ground_truth)
+            prior_latlon = (ground_truth.latitude, ground_truth.longitude)
+
+        try:
+            image, camera, gravity, proj, bbox = self.demo.read_input_image(
+                str(image_path),
+                prior_latlon=prior_latlon,
+                tile_size_meters=self.config.tile_size_meters,
+            )
+
+            canvas = self._load_osm_canvas(proj, bbox)
+            self._sanitize_raster(canvas.raster)
+
+            with torch.inference_mode():
+                uv, yaw, prob, neural_map, image_rectified = self.demo.localize(
+                    image,
+                    camera,
+                    canvas,
+                    gravity=gravity,
+                )
+
+            xy = canvas.to_xy(uv)
+            latlon = proj.unproject(xy)
+
+            result.update(
+                {
+                    "pred_x_meters": float(xy[0]),
+                    "pred_y_meters": float(xy[1]),
+                    "pred_latitude": float(latlon[0]),
+                    "pred_longitude": float(latlon[1]),
+                    "pred_yaw": float(yaw.detach().cpu().item()),
+                    "pred_probability": float(prob.max().detach().cpu().item()),
+                    "error_message": "",
+                }
+            )
+
+            if self.config.save_artifacts:
+                self._save_artifacts(
+                    image_id=image_id,
+                    neural_map=neural_map,
+                    prob=prob,
+                    image_rectified=image_rectified,
+                    camera=camera,
+                    raster=canvas.raster,
+                )
+
+            logger.info(
+                "Image %s localized: lat=%.6f, lon=%.6f, yaw=%.2f, prob=%.4f",
+                image_id,
+                result["pred_latitude"],
+                result["pred_longitude"],
+                result["pred_yaw"],
+                result["pred_probability"],
+            )
+
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            result["error_message"] = error_message
+
+            logger.error("Error processing image %s: %s", image_id, error_message)
+            logger.debug(traceback.format_exc())
+
+        finally:
+            self._cleanup_gpu_memory()
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # OrienterNet / OSM helpers
+    # -------------------------------------------------------------------------
+
+    def _load_osm_canvas(self, proj: Any, bbox: Any) -> Any:
+        tiler = TileManager.from_bbox(
+            proj,
+            bbox + 10,
+            self.demo.config.data.pixel_per_meter,
+        )
+
+        return tiler.query(bbox)
+
+    @staticmethod
+    def _sanitize_raster(raster: np.ndarray) -> None:
+        """
+        Clamp invalid raster layer values in-place.
+
+        This avoids model failures caused by out-of-range OSM raster values.
+        """
+        for layer_idx, max_value in enumerate(RASTER_LAYER_MAX_VALUES):
+            invalid_mask = raster[layer_idx] > max_value
+
+            if invalid_mask.any():
+                logger.warning(
+                    "Clamping %d invalid values in raster layer %d. Max allowed: %d",
+                    int(invalid_mask.sum()),
+                    layer_idx,
+                    max_value,
+                )
+
+                raster[layer_idx] = np.clip(raster[layer_idx], 0, max_value)
+
+    # -------------------------------------------------------------------------
+    # Artifact saving
+    # -------------------------------------------------------------------------
+
+    def _save_artifacts(
+        self,
+        image_id: int,
+        neural_map: Any,
+        prob: Any,
+        image_rectified: Any,
+        camera: Any,
+        raster: np.ndarray,
+    ) -> None:
+        folder = self.config.output_artifacts_dir / f"image_{image_id}"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        np.save(folder / "neural_map.npy", neural_map.detach().cpu().numpy())
+        np.save(folder / "prediction_prob.npy", prob.detach().cpu().numpy())
+
+        rectified_image = self._tensor_to_uint8_image(image_rectified)
+        Image.fromarray(rectified_image).save(folder / "rectified_image.png")
+
+        camera_dict = self._camera_to_dict(camera)
+        with (folder / "camera.json").open("w", encoding="utf-8") as f:
+            json.dump(camera_dict, f, indent=2)
+
+        rgb = Colormap.apply(raster)
+        Image.fromarray((rgb * 255).astype(np.uint8)).save(folder / "osm.png")
+
+    @staticmethod
+    def _tensor_to_uint8_image(image_tensor: Any) -> np.ndarray:
+        image = image_tensor.detach().cpu()
+
+        if image.ndim == 3:
+            image = image.permute(1, 2, 0)
+
+        image_np = image.numpy()
+        image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
+
+        return image_np
+
+    @staticmethod
+    def _camera_to_dict(camera: Any) -> Dict[str, Any]:
+        return {
+            "width": int(camera.size[0].item()),
+            "height": int(camera.size[1].item()),
+            "fx": float(camera.f[0].item()),
+            "fy": float(camera.f[1].item()),
+            "cx": float(camera.c[0].item()),
+            "cy": float(camera.c[1].item()),
+            "dist": camera.dist.detach().cpu().tolist(),
+        }
+
+    # -------------------------------------------------------------------------
+    # Result row helpers
+    # -------------------------------------------------------------------------
+
+    def _empty_result_row(self, image_id: int, image_path: Path) -> Dict[str, Any]:
+        try:
+            relative_path = image_path.relative_to(self.config.images_dir.parent)
+        except ValueError:
+            relative_path = image_path
+
+        return {
+            "image_id": image_id,
+            "image_path": str(relative_path),
+            "h5_id_dataset": "",
+            "gt_latitude": np.nan,
+            "gt_longitude": np.nan,
+            "gt_yaw": np.nan,
+            "pred_latitude": np.nan,
+            "pred_longitude": np.nan,
+            "pred_x_meters": np.nan,
+            "pred_y_meters": np.nan,
+            "pred_yaw": np.nan,
+            "pred_probability": np.nan,
+            "error_message": "",
+        }
+
+    @staticmethod
+    def _add_ground_truth_to_result(
+        result: Dict[str, Any],
+        ground_truth: GroundTruthMetadata,
+    ) -> None:
+        result.update(
+            {
+                "h5_id_dataset": ground_truth.id_dataset,
+                "gt_latitude": ground_truth.latitude,
+                "gt_longitude": ground_truth.longitude,
+                "gt_yaw": ground_truth.yaw,
+            }
+        )
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+
+    def print_summary_stats(self) -> None:
         try:
             import pandas as pd
-
-            df = pd.read_csv(self.output_csv)
-
-            logger.info("\n=== SUMMARY STATISTICS ===")
-            logger.info(f"Total images processed: {len(df)}")
-            logger.info(f"Successful predictions: {(~df['pred_x_meters'].isna()).sum()}")
-            logger.info(f"Failed predictions: {(df['pred_x_meters'].isna()).sum()}")
-
-            if (~df['pred_x_meters'].isna()).sum() > 0:
-                # Compute errors if ground truth is available
-                valid_gt = ~df['gt_latitude'].isna()
-                if valid_gt.sum() > 0:
-                    # Simple distance calculation (not accurate, for reference only)
-                    logger.info(f"Images with ground truth: {valid_gt.sum()}")
         except ImportError:
-            logger.info("pandas not available for summary stats")
+            logger.info("pandas not available. Cannot print summary statistics.")
+            return
+
+        if not self.config.output_csv.exists():
+            logger.info("No CSV file found at %s", self.config.output_csv)
+            return
+
+        df = pd.read_csv(self.config.output_csv)
+
+        successful = df["pred_x_meters"].notna()
+        has_ground_truth = df["gt_latitude"].notna()
+
+        logger.info("")
+        logger.info("=== SUMMARY STATISTICS ===")
+        logger.info("Total rows: %d", len(df))
+        logger.info("Successful predictions: %d", int(successful.sum()))
+        logger.info("Failed predictions: %d", int((~successful).sum()))
+        logger.info("Rows with ground truth: %d", int(has_ground_truth.sum()))
+
+        if "error_message" in df.columns:
+            failed_with_error = df[df["error_message"].fillna("") != ""]
+            logger.info("Rows with error message: %d", len(failed_with_error))
+
+    # -------------------------------------------------------------------------
+    # Small utilities
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_h5_value(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_missing_number(value: Any) -> bool:
+        if value is None:
+            return True
+
+        text = str(value).strip().lower()
+
+        if text in {"", "nan", "none", "null"}:
+            return True
+
+        try:
+            return bool(np.isnan(float(text)))
+        except Exception:
+            return True
 
 
-def main():
+# =============================================================================
+# CLI
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Process images through OrienterNet and save results to CSV"
+        description="Process images through OrienterNet and save localization results to CSV.",
     )
+
     parser.add_argument(
         "--h5",
-        default="../data/bern_ground_all.h5",
-        help="Path to H5 file with metadata"
+        default="data/bern_ground_all.h5",
+        help="Path to H5 file with metadata.",
     )
+
     parser.add_argument(
         "--images-dir",
-        default="../data/extracted_images",
-        help="Directory containing local images"
+        default="data/extracted_images",
+        help="Directory containing local images.",
     )
+
     parser.add_argument(
         "--output-csv",
-        default="../data/orienternet_test.csv",
-        help="Output CSV file path"
+        default="data/orienternet_results.csv",
+        help="Output CSV file path.",
     )
+
+    parser.add_argument(
+        "--output-artifacts-dir",
+        default="data/image_outputs",
+        help="Directory for per-image output artifacts.",
+    )
+
     parser.add_argument(
         "--tile-size",
         type=int,
         default=64,
-        help="Tile size in meters"
+        help="Tile size in meters.",
     )
+
     parser.add_argument(
         "--num-rotations",
         type=int,
-        default=256,
-        help="Number of rotation hypotheses"
+        default=128,
+        help="Number of rotation hypotheses.",
     )
+
     parser.add_argument(
         "--max-images",
         type=int,
         default=None,
-        help="Maximum number of images to process (default: all)"
+        help="Maximum number of images to process. Default: all.",
     )
+
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Device to use, e.g. cuda, cuda:0, cuda:1, or cpu.",
+    )
+
+    parser.add_argument(
+        "--worker-id",
+        type=int,
+        default=0,
+        help="Worker index, from 0 to num-workers - 1.",
+    )
+
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Total number of worker shards. "
+            "This does not spawn processes; launch one process per worker manually."
+        ),
+    )
+
     parser.add_argument(
         "--stats",
         action="store_true",
-        help="Print summary statistics after processing"
+        help="Print summary statistics after processing.",
     )
+
     parser.add_argument(
         "--retry-failed",
         action="store_true",
         default=True,
-        help="Retry images with KeyError or NaN predictions (default: True)"
+        help="Retry images with KeyError or NaN predictions. Default: enabled.",
     )
+
     parser.add_argument(
         "--no-retry-failed",
         action="store_false",
         dest="retry_failed",
-        help="Do not retry failed images"
+        help="Do not retry failed images.",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--save-artifacts",
+        action="store_true",
+        help=(
+            "Save neural maps, probability maps, rectified image, camera JSON, "
+            "and OSM image. Disabled by default to save memory and disk space."
+        ),
+    )
 
-    # Create processor
-    processor = ImageProcessor(
-        h5_path=args.h5,
-        images_dir=args.images_dir,
-        output_csv=args.output_csv,
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> ProcessorConfig:
+    return ProcessorConfig(
+        h5_path=Path(args.h5),
+        images_dir=Path(args.images_dir),
+        output_csv=Path(args.output_csv),
+        output_artifacts_dir=Path(args.output_artifacts_dir),
         tile_size_meters=args.tile_size,
         num_rotations=args.num_rotations,
+        device=args.device,
+        save_artifacts=args.save_artifacts,
     )
 
-    # Process images
-    try:
-        processor.process_all_images(max_images=args.max_images, retry_failed=args.retry_failed)
 
-        # Print summary
+def main() -> None:
+    args = parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger.info("Project root: %s", PROJECT_ROOT)
+    logger.info("maploc exists: %s", (PROJECT_ROOT / "maploc").exists())
+    logger.info("Python executable: %s", sys.executable)
+
+    config = build_config(args)
+
+    try:
+        processor = ImageProcessor(config)
+
+        processor.process_all_images(
+            max_images=args.max_images,
+            retry_failed=args.retry_failed,
+            worker_id=args.worker_id,
+            num_workers=args.num_workers,
+        )
+
         if args.stats:
-            processor.get_summary_stats()
+            processor.print_summary_stats()
+
     except KeyboardInterrupt:
-        logger.info("\nProcessing interrupted by user")
+        logger.info("Processing interrupted by user.")
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+
+    except Exception as exc:
+        logger.error("Fatal error: %s", exc)
         logger.debug(traceback.format_exc())
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-

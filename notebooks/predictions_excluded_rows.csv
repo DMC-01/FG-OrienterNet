@@ -1,0 +1,1 @@
+image_id,image_path,h5_id_dataset,gt_latitude,gt_longitude,gt_yaw,pred_latitude,pred_longitude,pred_x_meters,pred_y_meters,pred_yaw,pred_probability,error_message
