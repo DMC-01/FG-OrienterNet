@@ -191,6 +191,15 @@ class GroundTruthMetadata:
 
 
 @dataclass
+class LocationPrior:
+    """Location prior with source information."""
+    latitude: float
+    longitude: float
+    yaw: Optional[float] = None  # Optional heading
+    source: str = "unknown"  # "h5" | "csv" | "exif" | "combined"
+
+
+@dataclass
 class ProcessorConfig:
     h5_path: Path
     images_dir: Path
@@ -258,6 +267,46 @@ class ImageProcessor:
         logger.info("Demo device: %s", self.demo.device)
 
         self._init_csv()
+
+    # -------------------------------------------------------------------------
+    # CSV Prior helpers
+    # -------------------------------------------------------------------------
+
+    def load_csv_priors(self) -> Dict[int, LocationPrior]:
+        """Load location priors from CSV file."""
+        csv_priors: Dict[int, LocationPrior] = {}
+
+        if self.config.csv_prior_path is None or not self.config.csv_prior_path.exists():
+            return csv_priors
+
+        logger.info("Loading CSV priors from %s", self.config.csv_prior_path)
+
+        try:
+            with self.config.csv_prior_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    image_id = self._safe_int(row.get("image_id"))
+                    if image_id is None:
+                        continue
+
+                    lat = self._safe_float(row.get("latitude"))
+                    lon = self._safe_float(row.get("longitude"))
+                    yaw = self._safe_float(row.get("yaw"))
+
+                    if lat is not None and lon is not None:
+                        csv_priors[image_id] = LocationPrior(
+                            latitude=lat,
+                            longitude=lon,
+                            yaw=yaw,
+                            source="csv",
+                        )
+
+            logger.info("Loaded %d CSV priors", len(csv_priors))
+
+        except Exception as exc:
+            logger.error("Failed to load CSV priors: %s", exc)
+
+        return csv_priors
 
     # -------------------------------------------------------------------------
     # GPU memory management
@@ -431,22 +480,27 @@ class ImageProcessor:
         )
 
     # -------------------------------------------------------------------------
-    # Image discovery
+    # Image discovery (extracted or original)
     # -------------------------------------------------------------------------
 
     def find_local_images(self) -> list[Path]:
         """Find local image files matching image_*.jpg or image_*.png."""
-        logger.info("Scanning for images in %s", self.config.images_dir)
+        # If original images directory is specified, prefer it
+        images_dir = self.config.images_dir_original or self.config.images_dir
 
-        if not self.config.images_dir.exists():
-            raise FileNotFoundError(f"Images directory not found: {self.config.images_dir}")
+        logger.info("Scanning for images in %s", images_dir)
 
-        jpg_images = sorted(self.config.images_dir.glob("image_*.jpg"))
-        png_images = sorted(self.config.images_dir.glob("image_*.png"))
+        if not images_dir.exists():
+            raise FileNotFoundError(f"Images directory not found: {images_dir}")
+
+        jpg_images = sorted(images_dir.glob("image_*.jpg"))
+        png_images = sorted(images_dir.glob("image_*.png"))
 
         images = jpg_images + png_images
 
         logger.info("Found %d images", len(images))
+        if self.config.images_dir_original:
+            logger.info("Using original images from %s", self.config.images_dir_original)
         return images
 
     @staticmethod
@@ -475,6 +529,7 @@ class ImageProcessor:
             )
 
         h5_metadata = self.load_h5_metadata()
+        csv_priors = self.load_csv_priors()  # Load CSV priors if available
         processed_ids = self.load_processed_image_ids()
 
         failed_ids: Set[int] = set()
@@ -535,6 +590,7 @@ class ImageProcessor:
                 image_id=image_id,
                 image_path=image_path,
                 h5_metadata=h5_metadata,
+                csv_priors=csv_priors,
             )
 
             if is_retry:
@@ -553,6 +609,7 @@ class ImageProcessor:
         image_id: int,
         image_path: Path,
         h5_metadata: Dict[int, GroundTruthMetadata],
+        csv_priors: Dict[int, LocationPrior],
     ) -> Dict[str, Any]:
         """Process one image and return one CSV row."""
         result = self._empty_result_row(image_id, image_path)
@@ -568,11 +625,29 @@ class ImageProcessor:
             prior_latlon = None
         else:
             self._add_ground_truth_to_result(result, ground_truth)
-            prior_latlon = (ground_truth.latitude, ground_truth.longitude)
             # Store source position (from h5)
             result["src_latitude"] = ground_truth.latitude
             result["src_longitude"] = ground_truth.longitude
             result["src_yaw"] = ground_truth.yaw
+
+        # Resolve location prior based on strategy
+        location_prior, prior_source = self._resolve_location_prior(
+            image_id, image_path, ground_truth, csv_priors
+        )
+
+        if location_prior is not None:
+            prior_latlon = (location_prior.latitude, location_prior.longitude)
+            logger.info(
+                "Image %s: Using location prior from %s (lat=%.6f, lon=%.6f)",
+                image_id,
+                prior_source,
+                location_prior.latitude,
+                location_prior.longitude,
+            )
+        else:
+            prior_latlon = None
+            logger.warning("Image %s: No location prior found", image_id)
+            result["error_message"] = "No location prior found (no H5, CSV, or EXIF)"
 
         try:
             image, camera, gravity, proj, bbox = self.demo.read_input_image(
@@ -772,6 +847,68 @@ class ImageProcessor:
 
         return exif_data
 
+    def _extract_location_prior_from_exif(self, image_path: Path) -> Optional[LocationPrior]:
+        """Try to extract location prior from EXIF GPS data."""
+        try:
+            with open(image_path, "rb") as fid:
+                exif = EXIF(fid, lambda: None)
+                geo = exif.extract_geo()
+
+                if geo and "latitude" in geo and "longitude" in geo:
+                    lat = geo["latitude"]
+                    lon = geo["longitude"]
+                    alt = geo.get("altitude")
+
+                    return LocationPrior(
+                        latitude=lat,
+                        longitude=lon,
+                        yaw=None,
+                        source="exif",
+                    )
+        except Exception as exc:
+            logger.debug("Could not extract EXIF location from %s: %s", image_path, exc)
+
+        return None
+
+    def _resolve_location_prior(
+        self,
+        image_id: int,
+        image_path: Path,
+        h5_metadata: Optional[GroundTruthMetadata],
+        csv_priors: Dict[int, LocationPrior],
+    ) -> tuple[Optional[LocationPrior], str]:
+        """
+        Resolve location prior based on strategy.
+
+        Returns:
+            Tuple of (LocationPrior, source_description)
+            source_description: "csv", "exif", "h5", or "none"
+        """
+        strategy = self.config.prior_strategy.lower()
+
+        # Strategy 1: CSV prior (if available)
+        if strategy in ("csv", "fallback") and image_id in csv_priors:
+            return csv_priors[image_id], "csv"
+
+        # Strategy 2: EXIF geo (if available)
+        if strategy in ("exif", "fallback"):
+            exif_prior = self._extract_location_prior_from_exif(image_path)
+            if exif_prior is not None:
+                return exif_prior, "exif"
+
+        # Strategy 3: H5 metadata (always available as fallback)
+        if h5_metadata is not None:
+            prior = LocationPrior(
+                latitude=h5_metadata.latitude,
+                longitude=h5_metadata.longitude,
+                yaw=h5_metadata.yaw,
+                source="h5",
+            )
+            return prior, "h5"
+
+        # No prior found
+        return None, "none"
+
     # -------------------------------------------------------------------------
     # Result row helpers
     # -------------------------------------------------------------------------
@@ -872,6 +1009,15 @@ class ImageProcessor:
             return None
 
     @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
     def _is_missing_number(value: Any) -> bool:
         if value is None:
             return True
@@ -905,7 +1051,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--images-dir",
         default="data/extracted_images",
-        help="Directory containing local images.",
+        help="Directory containing extracted images.",
+    )
+
+    parser.add_argument(
+        "--images-dir-original",
+        default=None,
+        help=(
+            "Directory containing original (non-extracted) images. "
+            "If provided, these will be used instead of extracted images. "
+            "Filenames should match: image_<id>.jpg or image_<id>.png"
+        ),
     )
 
     parser.add_argument(
@@ -975,6 +1131,30 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default="cuda",
         help="Device to use, e.g. cuda, cuda:0, cuda:1, or cpu.",
+    )
+
+    parser.add_argument(
+        "--prior-strategy",
+        default="h5",
+        choices=["h5", "csv", "exif", "fallback"],
+        help=(
+            "Location prior strategy: "
+            "h5 - Use H5 metadata only; "
+            "csv - Use CSV prior if available, else H5; "
+            "exif - Use EXIF GPS if available, else H5; "
+            "fallback - Try CSV first, then EXIF, then H5. "
+            "Default: h5"
+        ),
+    )
+
+    parser.add_argument(
+        "--csv-prior",
+        default=None,
+        help=(
+            "Optional CSV file with location priors (latitude, longitude, yaw columns). "
+            "Used with --prior-strategy csv or fallback. "
+            "Image IDs must match image_<id>.jpg filenames."
+        ),
     )
 
     parser.add_argument(
@@ -1067,6 +1247,9 @@ def build_config(args: argparse.Namespace) -> ProcessorConfig:
         num_rotations=args.num_rotations,
         device=args.device,
         save_artifacts=args.save_artifacts,
+        images_dir_original=Path(args.images_dir_original) if args.images_dir_original else None,
+        prior_strategy=args.prior_strategy,
+        csv_prior_path=Path(args.csv_prior) if args.csv_prior else None,
     )
 
 
