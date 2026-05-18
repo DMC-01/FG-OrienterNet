@@ -18,3 +18,6 @@ geopy
 exifread
 urllib3>=2
 perspective2d @ git+https://github.com/jinlinyi/PerspectiveFields.git
+geopandas
+seaborn
+folium
