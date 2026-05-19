@@ -243,6 +243,48 @@ def build_run_name(tile_size: int, num_rotations: int, data_version: str) -> str
 
 
 class ImageProcessor:
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        """Convert common Python/numpy/torch/custom objects to JSON-safe values."""
+        if value is None:
+            return None
+
+        if isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, Path):
+            return str(value)
+
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+
+        if isinstance(value, np.ndarray):
+            return ImageProcessor._json_safe(value.tolist())
+
+        if isinstance(value, np.generic):
+            return value.item()
+
+        if isinstance(value, dict):
+            return {str(k): ImageProcessor._json_safe(v) for k, v in value.items()}
+
+        if isinstance(value, (list, tuple)):
+            return [ImageProcessor._json_safe(v) for v in value]
+
+        # Handle custom objects like BoundaryBox.
+        if hasattr(value, "__dict__"):
+            return {
+                str(k): ImageProcessor._json_safe(v)
+                for k, v in vars(value).items()
+                if not k.startswith("_")
+            }
+
+        # Last-resort fallback so json.dump never crashes.
+        return str(value)
+
     def __init__(self, config: ProcessorConfig):
         self.config = config
 
@@ -977,10 +1019,8 @@ class ImageProcessor:
         # Save the predicted pixel in map/image coordinates for easier inspection.
         predicted_uv_np = self._to_numpy(predicted_uv).reshape(-1).tolist()
         artifact_meta = {
-            "predicted_uv": [float(x) for x in predicted_uv_np],
-            "canvas_bbox": self._to_numpy(canvas.bbox).reshape(-1).tolist()
-            if hasattr(canvas, "bbox")
-            else None,
+            "predicted_uv": self._json_safe(predicted_uv),
+            "canvas_bbox": self._json_safe(canvas.bbox) if hasattr(canvas, "bbox") else None,
             "files": {
                 "rectified_image": "rectified_image.jpg",
                 "osm_tile": "osm_tile.jpg",
@@ -992,8 +1032,9 @@ class ImageProcessor:
                 "neural_map_raw": "neural_map.npy",
             },
         }
+
         with (folder / "artifacts.json").open("w", encoding="utf-8") as f:
-            json.dump(artifact_meta, f, indent=2)
+            json.dump(artifact_meta, f, indent=2, allow_nan=False)
 
         logger.info("Artifacts saved for image %d to %s", image_id, folder)
 
