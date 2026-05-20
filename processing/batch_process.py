@@ -860,8 +860,32 @@ class ImageProcessor:
                 tile_size_meters=self.config.tile_size_meters,
             )
 
+            logger.info("Image %s: loading OSM canvas", image_id)
             canvas = self._load_osm_canvas(proj, bbox)
+
+            logger.info(
+                "Image %s: OSM canvas loaded, raster shape=%s dtype=%s min=%s max=%s",
+                image_id,
+                getattr(canvas.raster, "shape", None),
+                getattr(canvas.raster, "dtype", None),
+                np.nanmin(canvas.raster),
+                np.nanmax(canvas.raster),
+            )
+
             self._sanitize_raster(canvas.raster)
+
+            logger.info(
+                "Image %s: raster sanitized, min=%s max=%s unique-per-layer=%s",
+                image_id,
+                np.nanmin(canvas.raster),
+                np.nanmax(canvas.raster),
+                [
+                    np.unique(canvas.raster[i]).tolist()[:20]
+                    for i in range(min(canvas.raster.shape[0], len(RASTER_LAYER_MAX_VALUES)))
+                ],
+            )
+
+            logger.info("Image %s: running OrienterNet localize", image_id)
 
             with torch.inference_mode():
                 uv, yaw, prob, neural_map, image_rectified = self.demo.localize(
@@ -907,12 +931,14 @@ class ImageProcessor:
                 result["pred_probability"],
             )
 
+
         except Exception as exc:
+
             error_message = f"{type(exc).__name__}: {exc}"
+
             result["error_message"] = error_message
 
-            logger.error("Error processing image %s: %s", image_id, error_message)
-            logger.debug(traceback.format_exc())
+            logger.exception("Error processing image %s: %s", image_id, error_message)
 
         finally:
             self._cleanup_gpu_memory()
@@ -939,18 +965,38 @@ class ImageProcessor:
 
         This avoids model failures caused by out-of-range OSM raster values.
         """
-        for layer_idx, max_value in enumerate(RASTER_LAYER_MAX_VALUES):
-            invalid_mask = raster[layer_idx] > max_value
+        if raster is None:
+            return
+
+        if raster.ndim < 3:
+            logger.warning("Unexpected raster shape: %s", getattr(raster, "shape", None))
+            return
+
+        num_layers = min(raster.shape[0], len(RASTER_LAYER_MAX_VALUES))
+
+        for layer_idx in range(num_layers):
+            max_value = RASTER_LAYER_MAX_VALUES[layer_idx]
+            layer = raster[layer_idx]
+
+            invalid_mask = (
+                    ~np.isfinite(layer)
+                    | (layer < 0)
+                    | (layer > max_value)
+            )
 
             if invalid_mask.any():
                 logger.warning(
-                    "Clamping %d invalid values in raster layer %d. Max allowed: %d",
+                    "Clamping %d invalid values in raster layer %d. "
+                    "Allowed range: [0, %d]. Before min=%s max=%s",
                     int(invalid_mask.sum()),
                     layer_idx,
                     max_value,
+                    np.nanmin(layer),
+                    np.nanmax(layer),
                 )
 
-                raster[layer_idx] = np.clip(raster[layer_idx], 0, max_value)
+                layer = np.nan_to_num(layer, nan=0, posinf=max_value, neginf=0)
+                raster[layer_idx] = np.clip(layer, 0, max_value)
 
     # -------------------------------------------------------------------------
     # Artifact saving
