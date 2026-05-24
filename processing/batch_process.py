@@ -920,6 +920,8 @@ class ImageProcessor:
                     raster=canvas.raster,
                     canvas=canvas,
                     predicted_uv=uv,
+                    proj=proj,
+                    bbox=bbox,
                 )
 
             logger.info(
@@ -1012,6 +1014,8 @@ class ImageProcessor:
         raster: np.ndarray,
         canvas: Any,
         predicted_uv: Any,
+        proj: Any = None,
+        bbox: Any = None,
     ) -> None:
         """Save demo-style visual artifacts for one prediction.
 
@@ -1064,9 +1068,24 @@ class ImageProcessor:
 
         # Save the predicted pixel in map/image coordinates for easier inspection.
         predicted_uv_np = self._to_numpy(predicted_uv).reshape(-1).tolist()
+
+        # Save georeferencing metadata for the exact model raster.  Older dashboard
+        # versions approximated the tile around the GT coordinate, which could make
+        # the request rectangle and prediction/neural overlays look rectangular or
+        # slightly rotated on the web map.  These lat/lon corners let the dashboard
+        # place osm_tile.jpg, prediction_map.jpg, and neural_map_rgb.jpg with the
+        # same geometry as the canvas passed to OrienterNet.
+        bbox_for_metadata = bbox if bbox is not None else getattr(canvas, "bbox", None)
+        tile_corners_latlon = self._projected_bbox_corners_latlon(proj, bbox_for_metadata)
+        tile_bounds_latlon = self._latlon_bounds_from_corners(tile_corners_latlon)
+
         artifact_meta = {
             "predicted_uv": self._json_safe(predicted_uv),
             "canvas_bbox": self._json_safe(canvas.bbox) if hasattr(canvas, "bbox") else None,
+            "tile_size_meters": self.config.tile_size_meters,
+            "raster_shape": self._json_safe(getattr(raster, "shape", None)),
+            "tile_corners_latlon": tile_corners_latlon,
+            "tile_bounds_latlon": tile_bounds_latlon,
             "files": {
                 "rectified_image": "rectified_image.jpg",
                 "osm_tile": "osm_tile.jpg",
@@ -1083,6 +1102,168 @@ class ImageProcessor:
             json.dump(artifact_meta, f, indent=2, allow_nan=False)
 
         logger.info("Artifacts saved for image %d to %s", image_id, folder)
+
+    @staticmethod
+    def _xy_pair(value: Any) -> Optional[Tuple[float, float]]:
+        """Convert a tensor/list/array-like object into an x/y pair."""
+        if value is None:
+            return None
+        try:
+            arr = ImageProcessor._to_numpy(value).reshape(-1)
+            if arr.size >= 2:
+                return float(arr[0]), float(arr[1])
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _bbox_xy_limits(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
+        """Return (min_x, min_y, max_x, max_y) from common BoundaryBox layouts."""
+        if bbox is None:
+            return None
+
+        def get_non_callable_attr(obj: Any, name: str) -> Any:
+            if not hasattr(obj, name):
+                return None
+            value = getattr(obj, name)
+            return None if callable(value) else value
+
+        # maploc BoundaryBox objects commonly expose min_/max_ corners.
+        for min_name, max_name in (("min_", "max_"), ("min", "max"), ("minimum", "maximum")):
+            min_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, min_name))
+            max_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, max_name))
+            if min_pair is not None and max_pair is not None:
+                return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
+
+        # Some bbox classes expose scalar edge attributes or center/size pairs.
+        scalar_attr_groups = [
+            ("min_x", "min_y", "max_x", "max_y"),
+            ("xmin", "ymin", "xmax", "ymax"),
+            ("left", "bottom", "right", "top"),
+            ("west", "south", "east", "north"),
+        ]
+        for k_min_x, k_min_y, k_max_x, k_max_y in scalar_attr_groups:
+            values = [
+                get_non_callable_attr(bbox, k_min_x),
+                get_non_callable_attr(bbox, k_min_y),
+                get_non_callable_attr(bbox, k_max_x),
+                get_non_callable_attr(bbox, k_max_y),
+            ]
+            if all(value is not None for value in values):
+                try:
+                    return tuple(float(value) for value in values)  # type: ignore[return-value]
+                except Exception:
+                    pass
+
+        center_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, "center"))
+        size_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, "size"))
+        if center_pair is not None and size_pair is not None:
+            half_x = size_pair[0] / 2.0
+            half_y = size_pair[1] / 2.0
+            return (
+                center_pair[0] - half_x,
+                center_pair[1] - half_y,
+                center_pair[0] + half_x,
+                center_pair[1] + half_y,
+            )
+
+        # Fall back through the JSON-safe representation so dictionaries/lists work too.
+        safe_bbox = ImageProcessor._json_safe(bbox)
+        if isinstance(safe_bbox, dict):
+            for min_name, max_name in (("min_", "max_"), ("min", "max"), ("minimum", "maximum")):
+                min_pair = ImageProcessor._xy_pair(safe_bbox.get(min_name))
+                max_pair = ImageProcessor._xy_pair(safe_bbox.get(max_name))
+                if min_pair is not None and max_pair is not None:
+                    return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
+
+            scalar_keys = [
+                ("min_x", "min_y", "max_x", "max_y"),
+                ("xmin", "ymin", "xmax", "ymax"),
+                ("left", "bottom", "right", "top"),
+                ("west", "south", "east", "north"),
+            ]
+            for k_min_x, k_min_y, k_max_x, k_max_y in scalar_keys:
+                if all(k in safe_bbox for k in (k_min_x, k_min_y, k_max_x, k_max_y)):
+                    try:
+                        return (
+                            float(safe_bbox[k_min_x]),
+                            float(safe_bbox[k_min_y]),
+                            float(safe_bbox[k_max_x]),
+                            float(safe_bbox[k_max_y]),
+                        )
+                    except Exception:
+                        pass
+
+        if isinstance(safe_bbox, (list, tuple)):
+            if len(safe_bbox) == 2:
+                min_pair = ImageProcessor._xy_pair(safe_bbox[0])
+                max_pair = ImageProcessor._xy_pair(safe_bbox[1])
+                if min_pair is not None and max_pair is not None:
+                    return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
+            if len(safe_bbox) >= 4:
+                try:
+                    return tuple(float(v) for v in safe_bbox[:4])  # type: ignore[return-value]
+                except Exception:
+                    pass
+
+        return None
+
+    @staticmethod
+    def _projected_bbox_corners_latlon(
+        proj: Any,
+        bbox: Any,
+    ) -> Optional[Dict[str, Tuple[float, float]]]:
+        """Convert a projected model-canvas bbox into WGS84 corner coordinates.
+
+        The returned pairs are [latitude, longitude] and are ordered for web-map
+        image overlays.  If the projection object or bbox layout is unavailable,
+        return None so the dashboard can fall back to an approximate square.
+        """
+        if proj is None or bbox is None:
+            return None
+
+        limits = ImageProcessor._bbox_xy_limits(bbox)
+        if limits is None:
+            return None
+
+        min_x, min_y, max_x, max_y = limits
+
+        def unproject_pair(x: float, y: float) -> Tuple[float, float]:
+            latlon = proj.unproject(np.asarray([x, y], dtype=np.float64))
+            latlon_arr = np.asarray(latlon, dtype=np.float64).reshape(-1)
+            if latlon_arr.size < 2:
+                raise ValueError("Projection returned fewer than two coordinates")
+            return float(latlon_arr[0]), float(latlon_arr[1])
+
+        try:
+            return {
+                "top_left": unproject_pair(min_x, max_y),
+                "top_right": unproject_pair(max_x, max_y),
+                "bottom_left": unproject_pair(min_x, min_y),
+                "bottom_right": unproject_pair(max_x, min_y),
+            }
+        except Exception as exc:
+            logger.warning("Could not convert canvas bbox to lat/lon corners: %s", exc)
+            return None
+
+    @staticmethod
+    def _latlon_bounds_from_corners(
+        corners: Optional[Dict[str, Tuple[float, float]]],
+    ) -> Optional[Dict[str, float]]:
+        """Build south/west/north/east bounds from lat/lon corner metadata."""
+        if not corners:
+            return None
+        try:
+            lats = [float(pair[0]) for pair in corners.values()]
+            lons = [float(pair[1]) for pair in corners.values()]
+            return {
+                "south": min(lats),
+                "west": min(lons),
+                "north": max(lats),
+                "east": max(lons),
+            }
+        except Exception:
+            return None
 
     @staticmethod
     def _to_numpy(value: Any) -> np.ndarray:
