@@ -50,15 +50,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import logging
 import os
 import re
 import sys
+import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
 # =============================================================================
 # Project import setup
@@ -180,6 +183,8 @@ class ProcessorConfig:
     manifest_prefix_to_strip: str = DEFAULT_MANIFEST_PREFIX_TO_STRIP
     prior_strategy: str = "h5"
     csv_prior_path: Optional[Path] = None
+    raw_artifact_format: str = "none"
+    csv_lock_timeout_seconds: float = 120.0
 
 
 # =============================================================================
@@ -211,6 +216,36 @@ def configure_pytorch_memory() -> None:
             )
     else:
         logger.info("CUDA available: False")
+
+
+
+def configure_cpu_threads(cpu_threads: Optional[int]) -> None:
+    """Limit CPU thread pools used by PyTorch/BLAS libraries per process."""
+    if cpu_threads is None:
+        return
+    if cpu_threads < 1:
+        raise ValueError("--cpu-threads must be >= 1")
+
+    for env_name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[env_name] = str(cpu_threads)
+
+    try:
+        torch.set_num_threads(cpu_threads)
+    except Exception as exc:
+        logger.debug("Could not set torch CPU threads: %s", exc)
+
+    try:
+        torch.set_num_interop_threads(max(1, min(2, cpu_threads)))
+    except Exception as exc:
+        logger.debug("Could not set torch inter-op threads: %s", exc)
+
+    logger.info("CPU thread limit per process: %d", cpu_threads)
 
 
 # =============================================================================
@@ -382,50 +417,102 @@ class ImageProcessor:
     # CSV helpers
     # -------------------------------------------------------------------------
 
+    @contextmanager
+    def _csv_lock(self, purpose: str) -> Iterator[None]:
+        """Serialize access to the shared results CSV across worker processes.
+
+        The lock is an atomically-created directory named ``results.csv.lock``
+        next to the CSV. If a worker is killed while holding the lock, delete
+        that directory manually before retrying.
+        """
+        lock_dir = self.config.output_csv.with_name(self.config.output_csv.name + ".lock")
+        lock_dir.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + float(self.config.csv_lock_timeout_seconds)
+
+        while True:
+            try:
+                lock_dir.mkdir()
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for CSV lock {lock_dir} while trying to {purpose}. "
+                        "If no batch worker is running, delete this .lock directory and retry."
+                    )
+                time.sleep(0.20)
+
+        try:
+            yield
+        finally:
+            try:
+                lock_dir.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not remove CSV lock %s: %s", lock_dir, exc)
+
     def _init_csv(self) -> None:
         """Create output CSV if it does not already exist."""
-        if self.config.output_csv.exists():
-            return
+        with self._csv_lock("initialize CSV"):
+            if self.config.output_csv.exists():
+                return
 
-        logger.info("Creating CSV file: %s", self.config.output_csv)
-        self.config.output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-        with self.config.output_csv.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-            writer.writeheader()
-
-    def _append_csv_row(self, row: Dict[str, Any]) -> None:
-        """Append one result row to CSV."""
-        try:
-            with self.config.output_csv.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-                writer.writerow(row)
-        except Exception as exc:
-            logger.error("Failed to append row to CSV: %s", exc)
-
-    def _replace_csv_row(self, image_id: int, new_row: Dict[str, Any]) -> None:
-        """Replace existing CSV row for one image id."""
-        try:
-            rows = []
-
-            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-
-                for row in reader:
-                    current_id = self._safe_int(row.get("image_id"))
-
-                    if current_id == image_id:
-                        rows.append(new_row)
-                    else:
-                        rows.append(row)
+            logger.info("Creating CSV file: %s", self.config.output_csv)
+            self.config.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
             with self.config.output_csv.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writeheader()
-                writer.writerows(rows)
+
+    def _append_csv_row(self, row: Dict[str, Any]) -> None:
+        """Append one result row to CSV, serialized across workers."""
+        try:
+            with self._csv_lock("append a CSV row"):
+                with self.config.output_csv.open("a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+                    writer.writerow(row)
+        except Exception as exc:
+            logger.error("Failed to append row to CSV: %s", exc)
+            raise
+
+    def _replace_csv_row(self, image_id: int, new_row: Dict[str, Any]) -> None:
+        """Replace existing CSV row for one image id, serialized across workers."""
+        try:
+            with self._csv_lock(f"replace CSV row for image {image_id}"):
+                rows = []
+                replaced = False
+
+                if self.config.output_csv.exists():
+                    with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+
+                        for row in reader:
+                            current_id = self._safe_int(row.get("image_id"))
+
+                            if current_id == image_id:
+                                if not replaced:
+                                    rows.append(new_row)
+                                    replaced = True
+                                # Drop duplicate stale rows for the same image id.
+                            else:
+                                rows.append(row)
+
+                if not replaced:
+                    rows.append(new_row)
+
+                tmp_path = self.config.output_csv.with_name(
+                    f"{self.config.output_csv.name}.tmp.{os.getpid()}"
+                )
+                with tmp_path.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+                os.replace(tmp_path, self.config.output_csv)
 
         except Exception as exc:
             logger.error("Failed to update CSV row for image %s: %s", image_id, exc)
+            raise
 
     # -------------------------------------------------------------------------
     # H5 metadata
@@ -473,13 +560,14 @@ class ImageProcessor:
             return processed_ids
 
         try:
-            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
+            with self._csv_lock("read processed image IDs"):
+                with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
 
-                for row in reader:
-                    image_id = self._safe_int(row.get("image_id"))
-                    if image_id is not None:
-                        processed_ids.add(image_id)
+                    for row in reader:
+                        image_id = self._safe_int(row.get("image_id"))
+                        if image_id is not None:
+                            processed_ids.add(image_id)
 
             logger.info("Found %d already processed images", len(processed_ids))
 
@@ -502,16 +590,17 @@ class ImageProcessor:
             return failed_ids
 
         try:
-            with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
+            with self._csv_lock("read failed image IDs"):
+                with self.config.output_csv.open("r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
 
-                for row in reader:
-                    image_id = self._safe_int(row.get("image_id"))
-                    if image_id is None:
-                        continue
+                    for row in reader:
+                        image_id = self._safe_int(row.get("image_id"))
+                        if image_id is None:
+                            continue
 
-                    if self._row_should_be_retried(row):
-                        failed_ids.add(image_id)
+                        if self._row_should_be_retried(row):
+                            failed_ids.add(image_id)
 
             if failed_ids:
                 logger.info("Found %d failed images to retry", len(failed_ids))
@@ -935,11 +1024,18 @@ class ImageProcessor:
 
 
         except Exception as exc:
-
             error_message = f"{type(exc).__name__}: {exc}"
 
-            result["error_message"] = error_message
+            if self._is_fatal_exception(exc):
+                result["error_message"] = error_message
+                logger.exception(
+                    "Fatal error while processing image %s. Stopping batch: %s",
+                    image_id,
+                    error_message,
+                )
+                raise
 
+            result["error_message"] = error_message
             logger.exception("Error processing image %s: %s", image_id, error_message)
 
         finally:
@@ -1014,26 +1110,20 @@ class ImageProcessor:
         raster: np.ndarray,
         canvas: Any,
         predicted_uv: Any,
-        proj: Any = None,
-        bbox: Any = None,
+        proj: Any,
+        bbox: Any,
     ) -> None:
-        """Save demo-style visual artifacts for one prediction.
+        """Save dashboard-ready artifacts for one prediction.
 
-        The RGB exports intentionally mirror the OrienterNet demo notebook:
-        - OSM tile: ``Colormap.apply(canvas.raster)``
-        - prediction map: ``likelihood_overlay(prob.max(-1), map_viz.mean(...))``
-        - neural map: ``features_to_RGB(neural_map)``
-
-        The raw tensors are still saved as ``.npy`` files for debugging.
+        JPG/JSON artifacts are enough for the dashboard. Raw arrays are optional
+        because tensors such as 272×272×1024 float32 are about 288 MiB each.
+        Control raw outputs with ``--raw-artifact-format``.
         """
         folder = self.config.output_artifacts_dir / f"image_{image_id}"
         folder.mkdir(parents=True, exist_ok=True)
 
         prob_np = self._to_numpy(prob)
-        np.save(folder / "prediction_map.npy", prob_np)
-
         neural_map_np = self._to_numpy(neural_map)
-        np.save(folder / "neural_map.npy", neural_map_np)
 
         rectified_image = self._image_like_to_uint8(image_rectified)
         Image.fromarray(rectified_image).save(folder / "rectified_image.jpg")
@@ -1042,60 +1132,55 @@ class ImageProcessor:
         with (folder / "camera.json").open("w", encoding="utf-8") as f:
             json.dump(camera_dict, f, indent=2)
 
-        # Demo-equivalent OSM visualization. This is the categorical raster
-        # rendered through OrienterNet's colormap, not a satellite/base-map tile.
         map_viz = Colormap.apply(raster)
         self._save_float_rgb(folder / "osm_tile.jpg", map_viz)
 
-        # Demo-equivalent prediction map. The localization probability is defined
-        # over x/y/rotation, so the notebook visualizes the best rotation per pixel.
         prediction_xy = prob_np.max(axis=-1) if prob_np.ndim >= 3 else prob_np
-        np.save(folder / "prediction_map_xy.npy", prediction_xy)
-
         prediction_overlay = likelihood_overlay(
             prediction_xy,
             map_viz.mean(axis=-1, keepdims=True),
         )
         self._save_float_rgb(folder / "prediction_map.jpg", prediction_overlay)
 
-        # A grayscale probability-only export is useful to check whether the
-        # model produced a non-zero spatial likelihood away from the overlay.
         probability_rgb = self._probability_to_uint8_rgb(prediction_xy)
         Image.fromarray(probability_rgb).save(folder / "prediction_probability.jpg")
 
         neural_map_rgb = self._neural_map_to_rgb(neural_map_np)
         Image.fromarray(neural_map_rgb).save(folder / "neural_map_rgb.jpg")
 
-        # Save the predicted pixel in map/image coordinates for easier inspection.
-        predicted_uv_np = self._to_numpy(predicted_uv).reshape(-1).tolist()
+        raw_files: Dict[str, Optional[str]] = {
+            "prediction_map_raw": self._save_raw_array(folder, "prediction_map", prob_np),
+            "prediction_map_xy_raw": self._save_raw_array(folder, "prediction_map_xy", prediction_xy),
+            "neural_map_raw": self._save_raw_array(folder, "neural_map", neural_map_np),
+        }
 
-        # Save georeferencing metadata for the exact model raster.  Older dashboard
-        # versions approximated the tile around the GT coordinate, which could make
-        # the request rectangle and prediction/neural overlays look rectangular or
-        # slightly rotated on the web map.  These lat/lon corners let the dashboard
-        # place osm_tile.jpg, prediction_map.jpg, and neural_map_rgb.jpg with the
-        # same geometry as the canvas passed to OrienterNet.
-        bbox_for_metadata = bbox if bbox is not None else getattr(canvas, "bbox", None)
-        tile_corners_latlon = self._projected_bbox_corners_latlon(proj, bbox_for_metadata)
-        tile_bounds_latlon = self._latlon_bounds_from_corners(tile_corners_latlon)
+        files: Dict[str, Optional[str]] = {
+            "rectified_image": "rectified_image.jpg",
+            "osm_tile": "osm_tile.jpg",
+            "neural_map_rgb": "neural_map_rgb.jpg",
+            "prediction_map": "prediction_map.jpg",
+            "prediction_probability": "prediction_probability.jpg",
+        }
+        files.update({key: value for key, value in raw_files.items() if value})
+
+        bbox_for_meta = getattr(canvas, "bbox", None) or bbox
+        tile_corners = self._tile_corners_latlon(proj, bbox_for_meta)
+        tile_bounds = self._tile_bounds_latlon(tile_corners)
 
         artifact_meta = {
             "predicted_uv": self._json_safe(predicted_uv),
-            "canvas_bbox": self._json_safe(canvas.bbox) if hasattr(canvas, "bbox") else None,
-            "tile_size_meters": self.config.tile_size_meters,
-            "raster_shape": self._json_safe(getattr(raster, "shape", None)),
-            "tile_corners_latlon": tile_corners_latlon,
-            "tile_bounds_latlon": tile_bounds_latlon,
-            "files": {
-                "rectified_image": "rectified_image.jpg",
-                "osm_tile": "osm_tile.jpg",
-                "neural_map_rgb": "neural_map_rgb.jpg",
-                "prediction_map": "prediction_map.jpg",
-                "prediction_probability": "prediction_probability.jpg",
-                "prediction_map_raw": "prediction_map.npy",
-                "prediction_map_xy_raw": "prediction_map_xy.npy",
-                "neural_map_raw": "neural_map.npy",
-            },
+            "canvas_bbox": self._json_safe(getattr(canvas, "bbox", None)) if hasattr(canvas, "bbox") else None,
+            "input_bbox": self._json_safe(bbox),
+            "raster_shape": list(np.asarray(raster).shape),
+            "tile_radius_meters": float(self.config.tile_size_meters),
+            "tile_size_meters": float(self.config.tile_size_meters),
+            "tile_side_meters": float(self.config.tile_size_meters) * 2.0,
+            "tile_diameter_meters": float(self.config.tile_size_meters) * 2.0,
+            "pixel_per_meter": self._json_safe(getattr(self.demo.config.data, "pixel_per_meter", None)),
+            "raw_artifact_format": self.config.raw_artifact_format,
+            "tile_corners_latlon": tile_corners,
+            "tile_bounds_latlon": tile_bounds,
+            "files": files,
         }
 
         with (folder / "artifacts.json").open("w", encoding="utf-8") as f:
@@ -1103,167 +1188,165 @@ class ImageProcessor:
 
         logger.info("Artifacts saved for image %d to %s", image_id, folder)
 
-    @staticmethod
-    def _xy_pair(value: Any) -> Optional[Tuple[float, float]]:
-        """Convert a tensor/list/array-like object into an x/y pair."""
-        if value is None:
+    def _save_raw_array(self, folder: Path, stem: str, array: np.ndarray) -> Optional[str]:
+        """Save a raw array according to ``--raw-artifact-format``."""
+        fmt = self.config.raw_artifact_format
+        if fmt == "none":
             return None
+
+        if fmt == "npy":
+            path = folder / f"{stem}.npy"
+            np.save(path, array)
+            return path.name
+
+        if fmt == "npz":
+            path = folder / f"{stem}.npz"
+            np.savez(path, data=array)
+            return path.name
+
+        if fmt == "npz-compressed":
+            path = folder / f"{stem}.npz"
+            np.savez_compressed(path, data=array)
+            return path.name
+
+        raise ValueError(f"Unsupported raw artifact format: {fmt}")
+
+    @classmethod
+    def _tile_corners_latlon(cls, proj: Any, bbox: Any) -> Optional[Dict[str, Dict[str, float]]]:
+        limits = cls._bbox_xy_limits(bbox)
+        if limits is None:
+            return None
+
+        xmin, ymin, xmax, ymax = limits
+        corners_xy = {
+            "top_left": (xmin, ymax),
+            "top_right": (xmax, ymax),
+            "bottom_left": (xmin, ymin),
+            "bottom_right": (xmax, ymin),
+        }
+
+        corners: Dict[str, Dict[str, float]] = {}
         try:
-            arr = ImageProcessor._to_numpy(value).reshape(-1)
-            if arr.size >= 2:
-                return float(arr[0]), float(arr[1])
+            for name, xy in corners_xy.items():
+                latlon = proj.unproject(np.asarray(xy, dtype=float))
+                latlon_np = cls._to_numpy(latlon).reshape(-1)
+                corners[name] = {"lat": float(latlon_np[0]), "lon": float(latlon_np[1])}
+        except Exception as exc:
+            logger.debug("Could not unproject tile corners: %s", exc)
+            return None
+        return corners
+
+    @staticmethod
+    def _tile_bounds_latlon(corners: Optional[Dict[str, Dict[str, float]]]) -> Optional[Dict[str, float]]:
+        if not corners:
+            return None
+        lats = [float(value["lat"]) for value in corners.values()]
+        lons = [float(value["lon"]) for value in corners.values()]
+        return {
+            "south": min(lats),
+            "north": max(lats),
+            "west": min(lons),
+            "east": max(lons),
+            "min_lat": min(lats),
+            "max_lat": max(lats),
+            "min_lon": min(lons),
+            "max_lon": max(lons),
+        }
+
+    @classmethod
+    def _bbox_xy_limits(cls, bbox: Any) -> Optional[Tuple[float, float, float, float]]:
+        """Extract xmin, ymin, xmax, ymax from common BoundaryBox shapes."""
+        if bbox is None:
+            return None
+
+        min_value = cls._get_attr_or_key(bbox, "min_")
+        if min_value is None:
+            min_value = cls._get_attr_or_key(bbox, "min")
+        max_value = cls._get_attr_or_key(bbox, "max_")
+        if max_value is None:
+            max_value = cls._get_attr_or_key(bbox, "max")
+        if min_value is not None and max_value is not None:
+            try:
+                mn = cls._to_numpy(min_value).reshape(-1)
+                mx = cls._to_numpy(max_value).reshape(-1)
+                if mn.size >= 2 and mx.size >= 2:
+                    x0, y0 = float(mn[0]), float(mn[1])
+                    x1, y1 = float(mx[0]), float(mx[1])
+                    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            except Exception:
+                pass
+
+        for names in [
+            ("xmin", "ymin", "xmax", "ymax"),
+            ("min_x", "min_y", "max_x", "max_y"),
+            ("left", "bottom", "right", "top"),
+            ("west", "south", "east", "north"),
+        ]:
+            values = [cls._get_attr_or_key(bbox, name) for name in names]
+            if all(value is not None for value in values):
+                try:
+                    x0, y0, x1, y1 = [float(cls._to_numpy(value).reshape(-1)[0]) for value in values]
+                    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                except Exception:
+                    pass
+
+        try:
+            arr = cls._to_numpy(bbox)
+            if arr.shape == (2, 2):
+                x0, y0 = float(arr[0, 0]), float(arr[0, 1])
+                x1, y1 = float(arr[1, 0]), float(arr[1, 1])
+                return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            flat = arr.reshape(-1)
+            if flat.size >= 4:
+                x0, y0, x1, y1 = [float(v) for v in flat[:4]]
+                return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
         except Exception:
             pass
         return None
 
     @staticmethod
-    def _bbox_xy_limits(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
-        """Return (min_x, min_y, max_x, max_y) from common BoundaryBox layouts."""
-        if bbox is None:
+    def _get_attr_or_key(obj: Any, name: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name)
+        value = getattr(obj, name, None)
+        if callable(value):
             return None
-
-        def get_non_callable_attr(obj: Any, name: str) -> Any:
-            if not hasattr(obj, name):
-                return None
-            value = getattr(obj, name)
-            return None if callable(value) else value
-
-        # maploc BoundaryBox objects commonly expose min_/max_ corners.
-        for min_name, max_name in (("min_", "max_"), ("min", "max"), ("minimum", "maximum")):
-            min_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, min_name))
-            max_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, max_name))
-            if min_pair is not None and max_pair is not None:
-                return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
-
-        # Some bbox classes expose scalar edge attributes or center/size pairs.
-        scalar_attr_groups = [
-            ("min_x", "min_y", "max_x", "max_y"),
-            ("xmin", "ymin", "xmax", "ymax"),
-            ("left", "bottom", "right", "top"),
-            ("west", "south", "east", "north"),
-        ]
-        for k_min_x, k_min_y, k_max_x, k_max_y in scalar_attr_groups:
-            values = [
-                get_non_callable_attr(bbox, k_min_x),
-                get_non_callable_attr(bbox, k_min_y),
-                get_non_callable_attr(bbox, k_max_x),
-                get_non_callable_attr(bbox, k_max_y),
-            ]
-            if all(value is not None for value in values):
-                try:
-                    return tuple(float(value) for value in values)  # type: ignore[return-value]
-                except Exception:
-                    pass
-
-        center_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, "center"))
-        size_pair = ImageProcessor._xy_pair(get_non_callable_attr(bbox, "size"))
-        if center_pair is not None and size_pair is not None:
-            half_x = size_pair[0] / 2.0
-            half_y = size_pair[1] / 2.0
-            return (
-                center_pair[0] - half_x,
-                center_pair[1] - half_y,
-                center_pair[0] + half_x,
-                center_pair[1] + half_y,
-            )
-
-        # Fall back through the JSON-safe representation so dictionaries/lists work too.
-        safe_bbox = ImageProcessor._json_safe(bbox)
-        if isinstance(safe_bbox, dict):
-            for min_name, max_name in (("min_", "max_"), ("min", "max"), ("minimum", "maximum")):
-                min_pair = ImageProcessor._xy_pair(safe_bbox.get(min_name))
-                max_pair = ImageProcessor._xy_pair(safe_bbox.get(max_name))
-                if min_pair is not None and max_pair is not None:
-                    return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
-
-            scalar_keys = [
-                ("min_x", "min_y", "max_x", "max_y"),
-                ("xmin", "ymin", "xmax", "ymax"),
-                ("left", "bottom", "right", "top"),
-                ("west", "south", "east", "north"),
-            ]
-            for k_min_x, k_min_y, k_max_x, k_max_y in scalar_keys:
-                if all(k in safe_bbox for k in (k_min_x, k_min_y, k_max_x, k_max_y)):
-                    try:
-                        return (
-                            float(safe_bbox[k_min_x]),
-                            float(safe_bbox[k_min_y]),
-                            float(safe_bbox[k_max_x]),
-                            float(safe_bbox[k_max_y]),
-                        )
-                    except Exception:
-                        pass
-
-        if isinstance(safe_bbox, (list, tuple)):
-            if len(safe_bbox) == 2:
-                min_pair = ImageProcessor._xy_pair(safe_bbox[0])
-                max_pair = ImageProcessor._xy_pair(safe_bbox[1])
-                if min_pair is not None and max_pair is not None:
-                    return min_pair[0], min_pair[1], max_pair[0], max_pair[1]
-            if len(safe_bbox) >= 4:
-                try:
-                    return tuple(float(v) for v in safe_bbox[:4])  # type: ignore[return-value]
-                except Exception:
-                    pass
-
-        return None
+        return value
 
     @staticmethod
-    def _projected_bbox_corners_latlon(
-        proj: Any,
-        bbox: Any,
-    ) -> Optional[Dict[str, Tuple[float, float]]]:
-        """Convert a projected model-canvas bbox into WGS84 corner coordinates.
-
-        The returned pairs are [latitude, longitude] and are ordered for web-map
-        image overlays.  If the projection object or bbox layout is unavailable,
-        return None so the dashboard can fall back to an approximate square.
-        """
-        if proj is None or bbox is None:
-            return None
-
-        limits = ImageProcessor._bbox_xy_limits(bbox)
-        if limits is None:
-            return None
-
-        min_x, min_y, max_x, max_y = limits
-
-        def unproject_pair(x: float, y: float) -> Tuple[float, float]:
-            latlon = proj.unproject(np.asarray([x, y], dtype=np.float64))
-            latlon_arr = np.asarray(latlon, dtype=np.float64).reshape(-1)
-            if latlon_arr.size < 2:
-                raise ValueError("Projection returned fewer than two coordinates")
-            return float(latlon_arr[0]), float(latlon_arr[1])
+    def _is_fatal_exception(exc: BaseException) -> bool:
+        """Return True for errors where continuing would waste time or corrupt output."""
+        if isinstance(exc, MemoryError):
+            return True
 
         try:
-            return {
-                "top_left": unproject_pair(min_x, max_y),
-                "top_right": unproject_pair(max_x, max_y),
-                "bottom_left": unproject_pair(min_x, min_y),
-                "bottom_right": unproject_pair(max_x, min_y),
-            }
-        except Exception as exc:
-            logger.warning("Could not convert canvas bbox to lat/lon corners: %s", exc)
-            return None
-
-    @staticmethod
-    def _latlon_bounds_from_corners(
-        corners: Optional[Dict[str, Tuple[float, float]]],
-    ) -> Optional[Dict[str, float]]:
-        """Build south/west/north/east bounds from lat/lon corner metadata."""
-        if not corners:
-            return None
-        try:
-            lats = [float(pair[0]) for pair in corners.values()]
-            lons = [float(pair[1]) for pair in corners.values()]
-            return {
-                "south": min(lats),
-                "west": min(lons),
-                "north": max(lats),
-                "east": max(lons),
-            }
+            cuda_oom_cls = torch.cuda.OutOfMemoryError
+            if isinstance(exc, cuda_oom_cls):
+                return True
         except Exception:
-            return None
+            pass
+
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in {
+            errno.ENOSPC,
+            errno.EDQUOT if hasattr(errno, "EDQUOT") else -1,
+            errno.ENOMEM,
+        }:
+            return True
+
+        text = f"{type(exc).__name__}: {exc}".lower()
+        fatal_fragments = [
+            "requested and 0 written",
+            "no space left on device",
+            "disk quota exceeded",
+            "not enough space",
+            "cannot allocate memory",
+            "out of memory",
+            "cuda out of memory",
+            "cudnn_status_alloc_failed",
+            "cublas_status_alloc_failed",
+            "defaultcpuallocator",
+        ]
+        return any(fragment in text for fragment in fatal_fragments)
 
     @staticmethod
     def _to_numpy(value: Any) -> np.ndarray:
@@ -1771,9 +1854,39 @@ def parse_args() -> argparse.Namespace:
         "--save-artifacts",
         action="store_true",
         help=(
-            "Save neural maps, probability maps, rectified image, camera JSON, "
-            "and OSM image. Disabled by default to save memory and disk space."
+            "Save dashboard artifacts: rectified image, model OSM raster JPG, "
+            "prediction maps, neural activation JPG, camera JSON, and artifact metadata. "
+            "Disabled by default to save memory and disk space."
         ),
+    )
+
+    parser.add_argument(
+        "--raw-artifact-format",
+        choices=["none", "npy", "npz", "npz-compressed"],
+        default="none",
+        help=(
+            "Optional format for raw tensor artifacts. 'none' saves only JPG/JSON files "
+            "needed by the dashboard and avoids huge files. 'npy' is fastest but largest; "
+            "'npz' stores an uncompressed ZIP container; 'npz-compressed' can save disk "
+            "space when arrays are compressible but costs CPU time. Default: none."
+        ),
+    )
+
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help=(
+            "Limit CPU threads used by this process. For two workers on a 10-core CPU, "
+            "use --cpu-threads 4 per worker to leave roughly two cores free."
+        ),
+    )
+
+    parser.add_argument(
+        "--csv-lock-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for the shared results.csv lock before failing. Default: 120.",
     )
 
     parser.add_argument(
@@ -1810,6 +1923,9 @@ def build_config(args: argparse.Namespace) -> ProcessorConfig:
     logger.info("Run directory: %s", run_dir)
     logger.info("Output CSV: %s", output_csv)
     logger.info("Output artifacts directory: %s", output_artifacts_dir)
+    logger.info("Raw artifact format: %s", args.raw_artifact_format)
+    if args.cpu_threads is not None:
+        logger.info("CPU threads per process: %s", args.cpu_threads)
 
     return ProcessorConfig(
         h5_path=Path(args.h5),
@@ -1820,6 +1936,9 @@ def build_config(args: argparse.Namespace) -> ProcessorConfig:
         num_rotations=args.num_rotations,
         device=args.device,
         save_artifacts=args.save_artifacts,
+        raw_artifact_format=args.raw_artifact_format,
+        cpu_threads=args.cpu_threads,
+        csv_lock_timeout_seconds=args.csv_lock_timeout,
         images_dir_original=(
             Path(args.images_dir_original) if args.images_dir_original else None
         ),
@@ -1833,12 +1952,13 @@ def build_config(args: argparse.Namespace) -> ProcessorConfig:
 
 
 def main() -> None:
-    configure_pytorch_memory()
-
     args = parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    configure_cpu_threads(args.cpu_threads)
+    configure_pytorch_memory()
 
     logger.info("Project root: %s", PROJECT_ROOT)
     logger.info("maploc exists: %s", (PROJECT_ROOT / "maploc").exists())
